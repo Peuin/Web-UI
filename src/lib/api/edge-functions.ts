@@ -153,7 +153,12 @@ export const platformApi = {
     });
   },
   listFolder(accessToken: string, params: URLSearchParams) {
-    return callEdgeFunction<{ folder: ApiDriveItem | null; items: ApiDriveItem[]; pagination: unknown }>(
+    return callEdgeFunction<{
+      folder: ApiDriveItem | null;
+      items: ApiDriveItem[];
+      pagination: unknown;
+      cache?: "HIT" | "MISS" | "DISABLED";
+    }>(
       `drive-list-folder?${params.toString()}`,
       accessToken,
       { method: "POST" },
@@ -234,16 +239,16 @@ export const platformApi = {
       root_folder_id?: string;
       selected_item: {
         id: string;
-        drive_file_id: string;
+        drive_item_id: string;
         name: string;
         item_type: string;
         mime_type: string;
-        parent_drive_file_id: string | null;
+        parent_drive_item_id: string | null;
         web_view_link: string | null;
       };
       selected_items: Array<{
         id: string;
-        drive_file_id: string;
+        drive_item_id: string;
         name: string;
         item_type: string;
         mime_type: string;
@@ -274,11 +279,13 @@ export const platformApi = {
 };
 
 export function normalizeDriveItem(item: ApiDriveItem): DriveItem {
+  const driveItemId = item.drive_item_id ?? item.id;
+
   return {
     id: item.id,
     connectionId: item.connection_id,
-    driveFileId: item.drive_file_id,
-    parentDriveFileId: item.parent_drive_file_id,
+    driveItemId,
+    parentDriveItemId: item.parent_drive_item_id,
     name: item.name,
     mimeType: item.mime_type ?? "application/octet-stream",
     itemType: item.item_type,

@@ -14,8 +14,8 @@ export type DriveConnection = {
 export type DriveItem = {
   id: string;
   connectionId: string;
-  driveFileId?: string;
-  parentDriveFileId: string | null;
+  driveItemId: string;
+  parentDriveItemId: string | null;
   name: string;
   mimeType: string;
   itemType: DriveItemType;
@@ -33,8 +33,8 @@ export type DriveItem = {
 export type ApiDriveItem = {
   id: string;
   connection_id: string;
-  drive_file_id?: string;
-  parent_drive_file_id: string | null;
+  drive_item_id: string;
+  parent_drive_item_id: string | null;
   name: string;
   mime_type: string | null;
   item_type: DriveItemType;
@@ -88,6 +88,33 @@ export type ApiWorkflowJob = {
   updated_at: string | null;
   workflow_job_files?: { id: string }[];
 };
+
+// ─── Supabase Storage (Model tab) ─────────────────────────────────────────────
+
+export type StorageItemType = "folder" | "file";
+
+export type StorageItem = {
+  /** Unique key within current directory — equals `name` */
+  id: string;
+  name: string;
+  /** Full storage path, e.g. google-drive/Model/WINTER CAPE 1/image.jpg */
+  path: string;
+  type: StorageItemType;
+  mimeType: string | null;
+  sizeBytes: number | null;
+  updatedAt: string | null;
+  metadata: Record<string, unknown> | null;
+  /** Public URL for image files (null for folders and non-image files) */
+  thumbnailUrl: string | null;
+};
+
+export type StorageBreadcrumb = {
+  label: string;
+  /** Full storage path for this crumb, e.g. google-drive/Model/WINTER CAPE 1 */
+  path: string;
+};
+
+// ─── Final output ──────────────────────────────────────────────────────────────
 
 export type FinalDateFilter = "all" | "today" | "7days" | "30days" | "custom";
 
