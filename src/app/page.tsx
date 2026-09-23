@@ -62,7 +62,6 @@ import type {
   DriveItemType,
   FinalDateFilter,
   FinalFile,
-  FinalRun,
   StorageBreadcrumb,
   StorageItem,
   WorkflowJob,
@@ -230,7 +229,6 @@ export default function Home() {
 
   // Final files state
   const [finalFiles, setFinalFiles] = useState<FinalFile[]>([]);
-  const [finalRuns, setFinalRuns] = useState<FinalRun[]>([]);
   const [finalLoading, setFinalLoading] = useState(false);
   const [finalError, setFinalError] = useState<string | null>(null);
   const [dateFilter, setDateFilter] = useState<FinalDateFilter>("all");
@@ -527,13 +525,11 @@ export default function Home() {
 
     if (!response.success || !response.data) {
       setFinalFiles([]);
-      setFinalRuns([]);
       setFinalError(response.error?.message ?? "Could not load generated files.");
       return;
     }
 
     setFinalFiles(response.data.files);
-    setFinalRuns(response.data.runs);
   }, [customFromDate, customToDate, dateFilter]);
 
   // ── Trigger Model Storage load when modelPath or activeTab changes ─────────
@@ -727,7 +723,6 @@ export default function Home() {
     setPreviewItem(null);
     setActiveJob(null);
     setFinalFiles([]);
-    setFinalRuns([]);
     setFinalError(null);
     setAppError(null);
   }
@@ -1246,7 +1241,6 @@ export default function Home() {
           {activeTab === "final" ? (
             <FinalPage
               files={finalFiles}
-              runs={finalRuns}
               loading={finalLoading}
               error={finalError}
               dateFilter={dateFilter}
@@ -3084,7 +3078,6 @@ function JobDetail({ job }: { job: WorkflowJob | null }) {
 
 function FinalPage({
   files,
-  runs,
   loading,
   error,
   dateFilter,
@@ -3096,7 +3089,6 @@ function FinalPage({
   onRefresh,
 }: {
   files: FinalFile[];
-  runs: FinalRun[];
   loading: boolean;
   error: string | null;
   dateFilter: FinalDateFilter;
