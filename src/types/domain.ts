@@ -26,6 +26,8 @@ export type DriveItem = {
   syncedAt: string;
   syncStatus: DriveSyncStatus;
   cacheStatus: CacheStatus;
+  /** Path of this item in Supabase Storage (drive_items.cached_storage_path). */
+  storagePath: string | null;
   treeDepth?: number;
   treePath?: string[];
 };

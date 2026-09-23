@@ -18,6 +18,7 @@ const config: Config = {
         foreground: "hsl(var(--foreground))",
         primary: {
           DEFAULT: "hsl(var(--primary))",
+          hover: "hsl(var(--primary-hover))",
           foreground: "hsl(var(--primary-foreground))",
         },
         secondary: {
@@ -40,14 +41,28 @@ const config: Config = {
           DEFAULT: "hsl(var(--card))",
           foreground: "hsl(var(--card-foreground))",
         },
+        brand: {
+          DEFAULT: "hsl(var(--brand))",
+          dark: "hsl(var(--brand-dark))",
+          ink: "hsl(var(--brand-ink))",
+          cream: "hsl(var(--brand-cream))",
+          paper: "hsl(var(--brand-paper))",
+          line: "hsl(var(--brand-line))",
+        },
+      },
+      fontFamily: {
+        inter: ["var(--font-inter)", "sans-serif"],
+        montserrat: ["var(--font-montserrat)", "sans-serif"],
       },
       borderRadius: {
-        lg: "8px",
-        md: "6px",
-        sm: "4px",
+        lg: "0px",
+        md: "0px",
+        sm: "0px",
+        card: "12px",
+        tile: "10px",
       },
       boxShadow: {
-        soft: "0 8px 30px rgba(15, 23, 42, 0.08)",
+        soft: "0 8px 30px rgba(28, 28, 28, 0.06)",
       },
     },
   },

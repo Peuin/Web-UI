@@ -3,23 +3,31 @@
 @tailwind utilities;
 
 :root {
-  --background: 210 33% 98%;
-  --foreground: 222 47% 11%;
+  /* Baartwork palette — warm paper, ink, terracotta accent */
+  --background: 40 33% 98%;
+  --foreground: 0 0% 11%;
   --card: 0 0% 100%;
-  --card-foreground: 222 47% 11%;
-  --primary: 173 80% 32%;
+  --card-foreground: 0 0% 11%;
+  --primary: 11 88% 65%;
+  --primary-hover: 11 76% 57%;
   --primary-foreground: 0 0% 100%;
-  --secondary: 216 33% 97%;
-  --secondary-foreground: 222 47% 11%;
-  --muted: 214 32% 93%;
-  --muted-foreground: 215 16% 42%;
-  --accent: 31 96% 58%;
-  --accent-foreground: 222 47% 11%;
-  --destructive: 0 72% 51%;
+  --secondary: 33 37% 95%;
+  --secondary-foreground: 0 0% 11%;
+  --muted: 33 25% 92%;
+  --muted-foreground: 0 0% 38%;
+  --accent: 15 80% 56%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 65% 48%;
   --destructive-foreground: 0 0% 100%;
-  --border: 214 32% 88%;
-  --input: 214 32% 88%;
-  --ring: 173 80% 32%;
+  --border: 34 9% 86%;
+  --input: 34 9% 84%;
+  --ring: 11 88% 65%;
+  --brand: 15 80% 56%;
+  --brand-dark: 15 68% 47%;
+  --brand-ink: 0 0% 11%;
+  --brand-cream: 33 37% 95%;
+  --brand-paper: 40 33% 98%;
+  --brand-line: 34 9% 84%;
 }
 
 * {
@@ -30,6 +38,17 @@ body {
   margin: 0;
   background: hsl(var(--background));
   color: hsl(var(--foreground));
+  font-family: var(--font-inter), system-ui, sans-serif;
+  letter-spacing: 0.01em;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-montserrat), system-ui, sans-serif;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
 
 button,
@@ -39,5 +58,5 @@ select {
 }
 
 ::selection {
-  background: rgba(20, 184, 166, 0.2);
+  background: hsl(var(--brand) / 0.2);
 }

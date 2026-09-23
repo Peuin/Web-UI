@@ -6,7 +6,7 @@ import {
   Check,
   ChevronRight,
   CircleAlert,
-  Cloud,
+  Copy,
   Database,
   Download,
   File,
@@ -14,6 +14,8 @@ import {
   FileText,
   Film,
   Folder,
+  FolderOpen,
+  Home as HomeIcon,
   FolderSync,
   Grid2X2,
   HardDrive,
@@ -21,13 +23,13 @@ import {
   Link,
   List,
   Loader2,
-  Lock,
-  LogIn,
+  LogOut,
   MoreHorizontal,
   Pencil,
   Play,
   RefreshCw,
   Search,
+  Share2,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -38,7 +40,9 @@ import {
 } from "lucide-react";
 import Image from "next/image";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { LoginScreen } from "@/components/auth/login-screen";
 import { Badge } from "@/components/ui/badge";
+import { FolderGlyph } from "@/components/ui/folder-glyph";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
@@ -71,6 +75,13 @@ type FolderCrumb = {
   driveItemId: string | null;
   storagePath?: string | null;
   name: string;
+  key?: string;
+};
+
+type FolderMeta = {
+  name: string;
+  driveItemId: string | null;
+  storagePath?: string | null;
 };
 
 const DEFAULT_CONNECTION_ID = "00000000-0000-0000-0000-000000000000";
@@ -78,6 +89,8 @@ const DEFAULT_CONNECTION_ID = "00000000-0000-0000-0000-000000000000";
 // Model tab — Supabase Storage constants
 const MODEL_BUCKET = "BAartworkShopify";
 const MODEL_ROOT_PATH = "google-drive/Model";
+// Storage folder mirroring the Drive root (see drive-list-folder DEFAULT_ROOT_PATH)
+const DRIVE_STORAGE_ROOT = "google-drive/01_New_Product_Raw";
 
 const typeIcon: Record<DriveItemType, typeof File> = {
   FOLDER: Folder,
@@ -124,15 +137,51 @@ function isValidStoragePrefix(value: string): boolean {
   return !invalidPatterns.some(pattern => value.includes(pattern));
 }
 
+function getFolderKeyFromItem(item: DriveItem): string {
+  return item.connectionId === "storage" ? item.driveItemId ?? item.id : item.driveItemId ?? item.id;
+}
+
+function getFolderKey(folderDriveId: string | null = null, storagePath: string | null = null): string {
+  return storagePath ?? folderDriveId ?? "root";
+}
+
+/** Single click previews, double click (or Enter) opens. */
+function previewOpenHandlers(onPreview: () => void, onOpen: () => void) {
+  return {
+    onClick: onPreview,
+    onDoubleClick: onOpen,
+    onKeyDown: (event: React.KeyboardEvent) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        onOpen();
+      }
+    },
+  };
+}
+
 export default function Home() {
   const [isSignedIn, setIsSignedIn] = useState(false);
   const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("browser");
   const [viewMode, setViewMode] = useState<ViewMode>("grid");
   const [query, setQuery] = useState("");
   const [items, setItems] = useState<DriveItem[]>([]);
   const [currentFolder, setCurrentFolder] = useState<DriveItem | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<FolderCrumb[]>([{ driveItemId: null, name: "Root folder" }]);
+  const [currentFolderKey, setCurrentFolderKey] = useState("root");
+  const [folderChildren, setFolderChildren] = useState<Record<string, DriveItem[]>>({});
+  const [folderParent, setFolderParent] = useState<Record<string, string>>({});
+  const [folderMeta, setFolderMeta] = useState<Record<string, FolderMeta>>({
+    root: { name: "Root folder", driveItemId: null, storagePath: null },
+  });
+  const folderParentRef = useRef<Record<string, string>>({});
+  const folderMetaRef = useRef<Record<string, FolderMeta>>({
+    root: { name: "Root folder", driveItemId: null, storagePath: null },
+  });
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set(["root"]));
+  const [loadingFolderKeys, setLoadingFolderKeys] = useState<Set<string>>(() => new Set());
   const [jobs, setJobs] = useState<WorkflowJob[]>([]);
   const [selectedItem, setSelectedItem] = useState<DriveItem | null>(null);
   const [previewItem, setPreviewItem] = useState<DriveItem | null>(null);
@@ -197,6 +246,12 @@ export default function Home() {
     return result.filter((item) => item.name.toLowerCase().includes(normalized));
   }, [items, query]);
 
+  const driveSummary = useMemo(() => {
+    const folderCount = filteredItems.filter((item) => item.itemType === "FOLDER").length;
+    const fileCount = filteredItems.length - folderCount;
+    return `${folderCount} ${folderCount === 1 ? "folder" : "folders"} · ${fileCount} ${fileCount === 1 ? "file" : "files"}`;
+  }, [filteredItems]);
+
   // ── Model breadcrumbs — computed from modelPath string ─────────────────────
   const modelBreadcrumbs = useMemo<StorageBreadcrumb[]>(() => {
     // modelPath = "google-drive/Model/Folder A/Folder B"
@@ -216,14 +271,11 @@ export default function Home() {
     return modelItems.filter((item) => item.name.toLowerCase().includes(normalized));
   }, [modelItems, modelQuery]);
 
-  const loadDrive = useCallback(async (
+  const fetchDriveFolder = useCallback(async (
     token: string,
-    folderDriveId: string | null = null,
-    storagePath: string | null = null,
+    folderDriveId: string | null,
+    storagePath: string | null,
   ) => {
-    setLoadingDrive(true);
-    setAppError(null);
-
     const allItems: ApiDriveItem[] = [];
     let folder: ApiDriveItem | null = null;
     let page = 1;
@@ -243,7 +295,9 @@ export default function Home() {
       }
 
       response = await platformApi.listFolder(token, params);
-      if (!response.success || !response.data) break;
+      if (!response.success || !response.data) {
+        return { response, items: [] as DriveItem[], folder: null as DriveItem | null };
+      }
 
       allItems.push(...response.data.items);
       folder ??= response.data.folder;
@@ -255,6 +309,99 @@ export default function Home() {
       response.data.pagination.has_more === true
     );
 
+    return {
+      response,
+      items: allItems.filter((item) => !isHiddenDrivePlaceholder(item)).map(normalizeDriveItem),
+      folder: folder && !isHiddenDrivePlaceholder(folder) ? normalizeDriveItem(folder) : null,
+    };
+  }, []);
+
+  const storeFolderChildren = useCallback((key: string, children: DriveItem[], parentName?: string) => {
+    const foldersOnly = children.filter((item) => item.itemType === "FOLDER");
+    setFolderChildren((current) => ({ ...current, [key]: foldersOnly }));
+    setFolderParent((current) => {
+      const next = { ...current };
+      for (const child of foldersOnly) {
+        next[getFolderKeyFromItem(child)] = key;
+      }
+      return next;
+    });
+    setFolderMeta((current) => {
+      const next: Record<string, FolderMeta> = {
+        ...current,
+        root: { name: "Root folder", driveItemId: null, storagePath: null },
+      };
+      if (parentName || key === "root") {
+        next[key] ??= { name: parentName ?? "Root folder", driveItemId: key === "root" ? null : key };
+      }
+      for (const child of foldersOnly) {
+        const childKey = getFolderKeyFromItem(child);
+        next[childKey] = {
+          name: child.name,
+          driveItemId: child.connectionId === "storage" ? null : child.driveItemId,
+          storagePath: child.connectionId === "storage" ? child.driveItemId : null,
+        };
+      }
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    folderParentRef.current = folderParent;
+  }, [folderParent]);
+
+  useEffect(() => {
+    folderMetaRef.current = folderMeta;
+  }, [folderMeta]);
+
+  const buildCrumbs = useCallback((key: string): FolderCrumb[] => {
+    const lineage: string[] = [];
+    let cursor = key;
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor)) {
+      lineage.unshift(cursor);
+      if (cursor === "root") break;
+      seen.add(cursor);
+      cursor = folderParentRef.current[cursor] ?? "root";
+    }
+    if (lineage[0] !== "root") lineage.unshift("root");
+    return lineage.map((crumbKey) => {
+      const meta = folderMetaRef.current[crumbKey] ?? { name: crumbKey, driveItemId: crumbKey };
+      return {
+        key: crumbKey,
+        driveItemId: meta.driveItemId,
+        storagePath: meta.storagePath,
+        name: meta.name,
+      };
+    });
+  }, []);
+
+  const expandAncestors = useCallback((key: string) => {
+    setExpanded((current) => {
+      const next = new Set(current);
+      let cursor = key;
+      const seen = new Set<string>();
+      while (cursor && !seen.has(cursor)) {
+        next.add(cursor);
+        if (cursor === "root") break;
+        seen.add(cursor);
+        cursor = folderParentRef.current[cursor] ?? "root";
+      }
+      next.add("root");
+      return next;
+    });
+  }, []);
+
+  const loadDrive = useCallback(async (
+    token: string,
+    folderDriveId: string | null = null,
+    storagePath: string | null = null,
+  ) => {
+    setLoadingDrive(true);
+    setAppError(null);
+    const key = getFolderKey(folderDriveId, storagePath);
+    const { response, items: normalizedItems, folder: normalizedFolder } = await fetchDriveFolder(token, folderDriveId, storagePath);
+
     setLoadingDrive(false);
 
     if (!response?.success || !response.data) {
@@ -265,13 +412,15 @@ export default function Home() {
       return;
     }
 
-    const normalizedItems = allItems.filter((item) => !isHiddenDrivePlaceholder(item)).map(normalizeDriveItem);
-    const normalizedFolder = folder && !isHiddenDrivePlaceholder(folder) ? normalizeDriveItem(folder) : null;
+    storeFolderChildren(key, normalizedItems, normalizedFolder?.name);
     setItems(normalizedItems);
     setCurrentFolder(normalizedFolder);
+    setCurrentFolderKey(key);
+    setBreadcrumbs(buildCrumbs(key));
+    expandAncestors(key);
     setPreviewItem(normalizedItems[0] ?? null);
     setSelectedItem(null);
-  }, []);
+  }, [buildCrumbs, expandAncestors, fetchDriveFolder, storeFolderChildren]);
 
   // ── Model tab: load from Supabase Storage directly — no Drive API ──────────
   const loadStorageItems = useCallback(async (path: string) => {
@@ -390,7 +539,9 @@ export default function Home() {
   // ── Trigger Model Storage load when modelPath or activeTab changes ─────────
   useEffect(() => {
     if (activeTab === "model") {
-      void loadStorageItems(modelPath);
+      queueMicrotask(() => {
+        void loadStorageItems(modelPath);
+      });
     }
   }, [modelPath, activeTab, loadStorageItems]);
 
@@ -401,6 +552,7 @@ export default function Home() {
     supabase.auth.getSession().then(({ data }) => {
       const token = data.session?.access_token ?? null;
       setAccessToken(token);
+      setUserEmail(data.session?.user.email ?? null);
       setIsSignedIn(Boolean(token));
       if (token) {
         void loadDrive(token);
@@ -411,6 +563,7 @@ export default function Home() {
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
       const token = session?.access_token ?? null;
       setAccessToken(token);
+      setUserEmail(session?.user.email ?? null);
       setIsSignedIn(Boolean(token));
       if (token) {
         void loadDrive(token);
@@ -427,10 +580,34 @@ export default function Home() {
     }
   }, [activeTab, accessToken, loadFinalFiles]);
 
+  // Storage path of a selected folder, used to prefill "Source Storage Prefix".
+  // Prefer the path stored in DB; otherwise derive it from the open folder path.
+  function folderStoragePrefix(folder: DriveItem): string {
+    if (folder.storagePath) return folder.storagePath;
+    const parents = breadcrumbs.slice(1).map((crumb) => crumb.name);
+    return [DRIVE_STORAGE_ROOT, ...parents, folder.name].join("/");
+  }
+
+  function applySelection(item: DriveItem) {
+    setSelectedItem(item);
+    if (item.itemType === "FOLDER") setSourceStoragePrefix(folderStoragePrefix(item));
+  }
+
   function toggleSelected(id: string) {
     const item = items.find((candidate) => candidate.id === id);
     if (!item) return;
-    setSelectedItem((current) => (current?.id === id ? null : item));
+    if (selectedItem?.id === id) {
+      setSelectedItem(null);
+      return;
+    }
+    applySelection(item);
+  }
+
+  // Single click on a card/row: select it (not toggle, so a double-click
+  // doesn't select-then-deselect) and show it in the right panel.
+  function selectAndPreview(item: DriveItem) {
+    applySelection(item);
+    setPreviewItem(item);
   }
 
   function getDescendantFiles(folderId: string): DriveItem[] {
@@ -459,13 +636,100 @@ export default function Home() {
     const driveItemId = folder.driveItemId;
     if (!accessToken || !driveItemId) return;
     const storagePath = folder.connectionId === "storage" ? driveItemId : null;
+    const key = getFolderKeyFromItem(folder);
     setQuery("");
-    setBreadcrumbs((current) => {
-      const existingIndex = current.findIndex((crumb) => crumb.driveItemId === driveItemId);
-      if (existingIndex >= 0) return current.slice(0, existingIndex + 1);
-      return [...current, { driveItemId, storagePath, name: folder.name }];
+    setFolderParent((current) => ({ ...current, [key]: currentFolderKey }));
+    setFolderMeta((current) => ({
+      ...current,
+      [key]: {
+        name: folder.name,
+        driveItemId: folder.connectionId === "storage" ? null : driveItemId,
+        storagePath,
+      },
+    }));
+    setExpanded((current) => {
+      const next = new Set(current);
+      next.add(currentFolderKey);
+      next.add(key);
+      return next;
     });
     void loadDrive(accessToken, storagePath ? null : driveItemId, storagePath);
+  }
+
+  async function loadFolderChildren(key: string) {
+    if (!accessToken || loadingFolderKeys.has(key) || folderChildren[key]) return;
+    const meta = folderMeta[key];
+    if (!meta) return;
+    setLoadingFolderKeys((current) => new Set(current).add(key));
+    const { response, items: normalizedItems } = await fetchDriveFolder(
+      accessToken,
+      meta.storagePath ? null : meta.driveItemId,
+      meta.storagePath ?? null,
+    );
+    setLoadingFolderKeys((current) => {
+      const next = new Set(current);
+      next.delete(key);
+      return next;
+    });
+    if (response?.success) {
+      storeFolderChildren(key, normalizedItems, meta.name);
+    }
+  }
+
+  function navigateFolderKey(key: string) {
+    if (!accessToken) return;
+    const meta = folderMeta[key];
+    if (!meta) return;
+    setQuery("");
+    setExpanded((current) => new Set(current).add(key));
+    void loadDrive(accessToken, meta.storagePath ? null : meta.driveItemId, meta.storagePath ?? null);
+  }
+
+  function toggleFolderKey(key: string) {
+    setExpanded((current) => {
+      const next = new Set(current);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+        void loadFolderChildren(key);
+      }
+      next.add("root");
+      return next;
+    });
+  }
+
+  async function signOut() {
+    const supabase = createBrowserSupabaseClient();
+    if (!supabase) return;
+
+    setSigningOut(true);
+    await supabase.auth.signOut();
+    setSigningOut(false);
+
+    // Clear the previous user's workspace so the next sign-in starts clean.
+    setAccessToken(null);
+    setUserEmail(null);
+    setIsSignedIn(false);
+    setActiveTab("browser");
+    setViewMode("grid");
+    setQuery("");
+    setItems([]);
+    setJobs([]);
+    setCurrentFolder(null);
+    setBreadcrumbs([{ driveItemId: null, name: "Root folder" }]);
+    setCurrentFolderKey("root");
+    setFolderChildren({});
+    setFolderParent({});
+    setFolderMeta({ root: { name: "Root folder", driveItemId: null, storagePath: null } });
+    setExpanded(new Set(["root"]));
+    setSelectedItem(null);
+    setPreviewItem(null);
+    setActiveJob(null);
+    setFinalFiles([]);
+    setFinalRuns([]);
+    setFinalError(null);
+    setAppError(null);
   }
 
   function switchTab(tab: WorkspaceTab) {
@@ -477,7 +741,6 @@ export default function Home() {
       setModelQuery("");
     }
     if (tab === "browser") {
-      setBreadcrumbs([{ driveItemId: null, name: "Root folder" }]);
       if (accessToken) void loadDrive(accessToken);
     }
   }
@@ -624,8 +887,7 @@ export default function Home() {
     if (!accessToken) return;
     const crumb = breadcrumbs[index];
     setQuery("");
-    setBreadcrumbs(breadcrumbs.slice(0, index + 1));
-    void loadDrive(accessToken, crumb.storagePath ? null : crumb.driveItemId, crumb.storagePath ?? null);
+    navigateFolderKey(crumb.key ?? getFolderKey(crumb.driveItemId, crumb.storagePath ?? null));
   }
 
   async function openDriveItem(item: DriveItem) {
@@ -639,6 +901,10 @@ export default function Home() {
   async function syncDrive() {
     if (!accessToken) return;
     if (currentFolder?.connectionId === "storage") {
+      setFolderChildren({});
+      setFolderParent({});
+      setFolderMeta({ root: { name: "Root folder", driveItemId: null, storagePath: null } });
+      setExpanded(new Set(["root"]));
       await loadDrive(accessToken, null, currentFolder.driveItemId);
       return;
     }
@@ -666,6 +932,10 @@ export default function Home() {
       setAppError(response.error?.message ?? "Could not trigger Drive Sync.");
       return;
     }
+    setFolderChildren({});
+    setFolderParent({});
+    setFolderMeta({ root: { name: "Root folder", driveItemId: null, storagePath: null } });
+    setExpanded(new Set(["root"]));
     await loadDrive(
       accessToken,
       currentFolder?.connectionId === "storage" ? null : currentFolder?.driveItemId ?? null,
@@ -781,7 +1051,13 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-background text-foreground">
       <div className="grid min-h-screen grid-cols-[260px_minmax(0,1fr)]">
-        <AppSidebar activeTab={activeTab} onTabChange={switchTab} />
+        <AppSidebar
+          activeTab={activeTab}
+          onTabChange={switchTab}
+          userEmail={userEmail}
+          signingOut={signingOut}
+          onSignOut={() => void signOut()}
+        />
         <section className="flex min-w-0 flex-col">
           <TopBar
             selectedItem={selectedItem}
@@ -800,32 +1076,41 @@ export default function Home() {
                   syncing={syncing}
                   onSync={syncDrive}
                   breadcrumbs={breadcrumbs}
+                  summary={loadingDrive ? "Loading…" : driveSummary}
                   onBreadcrumbSelect={selectBreadcrumb}
                   onRefresh={() =>
                     accessToken
-                      ? void loadDrive(
-                        accessToken,
-                        currentFolder?.connectionId === "storage"
-                          ? null
-                          : currentFolder?.driveItemId ?? null,
-                        currentFolder?.connectionId === "storage"
-                          ? currentFolder.driveItemId
-                          : null,
-                      )
+                      ? (setFolderChildren({}),
+                        setFolderParent({}),
+                        setFolderMeta({ root: { name: "Root folder", driveItemId: null, storagePath: null } }),
+                        setExpanded(new Set(["root"])),
+                        void loadDrive(
+                          accessToken,
+                          currentFolder?.connectionId === "storage"
+                            ? null
+                            : currentFolder?.driveItemId ?? null,
+                          currentFolder?.connectionId === "storage"
+                            ? currentFolder.driveItemId
+                            : null,
+                        ))
                       : undefined}
                 />
                 <div className="grid min-h-[calc(100vh-137px)] grid-cols-[240px_minmax(0,1fr)]">
                   <FolderTree
-                    activeFolderDriveId={currentFolder?.driveItemId ?? null}
-                    folders={folders}
-                    onRootSelect={() => selectBreadcrumb(0)}
-                    onFolderSelect={openFolder}
+                    rootChildren={folderChildren.root ?? folders}
+                    folderChildren={folderChildren}
+                    expanded={expanded}
+                    currentKey={currentFolderKey}
+                    loadingKeys={loadingFolderKeys}
+                    onNavigate={navigateFolderKey}
+                    onToggle={toggleFolderKey}
                   />
                   <DriveContent
                     items={filteredItems}
                     selectedItem={selectedItem}
+                    previewItem={previewItem}
                     onSelect={toggleSelected}
-                    onPreview={setPreviewItem}
+                    onPreview={selectAndPreview}
                     onOpen={openDriveItem}
                     viewMode={viewMode}
                     loading={loadingDrive}
@@ -857,6 +1142,7 @@ export default function Home() {
                 setVideoResolution={setVideoResolution}
                 submitting={submitting}
                 onSubmit={submitWorkflow}
+                onOpenFolder={openFolder}
               />
             </div>
           ) : null}
@@ -921,7 +1207,7 @@ export default function Home() {
                   error={modelError}
                 />
               </div>
-              <ModelPreviewPanel item={modelPreviewItem} />
+              <ModelPreviewPanel item={modelPreviewItem} onOpenFolder={openModelItem} />
 
               {/* ── Rename dialog ── */}
               {modelRenameItem ? (
@@ -995,99 +1281,18 @@ export default function Home() {
   );
 }
 
-function LoginScreen() {
-  const [identifier, setIdentifier] = useState("");
-  const [password, setPassword] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-
-  async function signIn() {
-    const supabase = createBrowserSupabaseClient();
-    if (!supabase) {
-      setErrorMessage(
-        "Missing NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY/NEXT_PUBLIC_SUPABASE_ANON_KEY.",
-      );
-      return;
-    }
-
-    setLoading(true);
-    setErrorMessage(null);
-    const response = await platformApi.login(identifier, password);
-
-    if (!response.success || !response.data?.session) {
-      setLoading(false);
-      setErrorMessage(response.error?.message ?? "Could not sign in.");
-      return;
-    }
-
-    const { error } = await supabase.auth.setSession({
-      access_token: response.data.session.access_token,
-      refresh_token: response.data.session.refresh_token,
-    });
-    setLoading(false);
-
-    if (error) {
-      setErrorMessage(error.message);
-    }
-  }
-
-  return (
-    <main className="flex min-h-screen items-center justify-center bg-background px-6">
-      <section className="w-full max-w-[420px] rounded-lg border border-border bg-card p-6 shadow-soft">
-        <div className="mb-6 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-md bg-primary text-primary-foreground">
-            <HardDrive className="h-5 w-5" />
-          </div>
-          <div>
-            <h1 className="text-xl font-semibold">Google Drive Media Workflow</h1>
-            <p className="text-sm text-muted-foreground">Supabase + n8n backend</p>
-          </div>
-        </div>
-        <div className="space-y-3">
-          <Input
-            placeholder="Username or email"
-            type="text"
-            value={identifier}
-            onChange={(event) => setIdentifier(event.target.value)}
-          />
-          <Input
-            placeholder="Password"
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-          />
-          {errorMessage ? (
-            <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-              {errorMessage}
-            </div>
-          ) : null}
-          <Button className="w-full" disabled={loading || !identifier || !password} onClick={signIn}>
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-            Sign in
-          </Button>
-        </div>
-        <p className="mt-3 text-xs text-muted-foreground">Development admin: admin / admin</p>
-        <div className="mt-6 grid gap-2 text-sm text-muted-foreground">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="h-4 w-4 text-primary" />
-            Google credentials stay in backend
-          </div>
-          <div className="flex items-center gap-2">
-            <Lock className="h-4 w-4 text-primary" />
-            Frontend only talks to Supabase
-          </div>
-        </div>
-      </section>
-    </main>
-  );
-}
-
 function AppSidebar({
   activeTab,
   onTabChange,
+  userEmail,
+  signingOut,
+  onSignOut,
 }: {
   activeTab: WorkspaceTab;
   onTabChange: (tab: WorkspaceTab) => void;
+  userEmail: string | null;
+  signingOut: boolean;
+  onSignOut: () => void;
 }) {
   const nav = [
     { id: "browser" as const, label: "Drive Browser", icon: HardDrive },
@@ -1095,38 +1300,68 @@ function AppSidebar({
     { id: "jobs" as const, label: "Workflow Jobs", icon: Workflow },
     { id: "final" as const, label: "Final Output", icon: ImageIcon },
   ];
+  const userLabel = userEmail ?? "Signed in";
 
   return (
-    <aside className="border-r border-border bg-card">
-      <div className="flex h-16 items-center gap-3 border-b border-border px-4">
-        <div className="flex h-9 w-9 items-center justify-center rounded-md bg-primary text-primary-foreground">
-          <Cloud className="h-5 w-5" />
-        </div>
+    <aside className="sticky top-0 flex h-screen flex-col border-r border-border bg-brand-cream">
+      <div className="flex h-16 items-center gap-3 border-b border-border px-5">
+        <Image
+          src="/brand/baartwork-logo.png"
+          alt="Baartwork"
+          width={360}
+          height={360}
+          priority
+          className="h-9 w-9 object-contain"
+        />
         <div className="min-w-0">
-          <div className="truncate text-sm font-semibold">Media Workflow</div>
-          <div className="truncate text-xs text-muted-foreground">Supabase + n8n backend</div>
+          <div className="truncate font-montserrat text-xs font-medium uppercase tracking-[0.12em]">
+            Media Workflow
+          </div>
+          <div className="truncate text-[11px] text-muted-foreground">Baartwork Studio</div>
         </div>
       </div>
-      <nav className="space-y-1 p-3">
+      <nav className="flex-1 space-y-0.5 px-3 py-4">
         {nav.map((item) => {
           const Icon = item.icon;
+          const active = activeTab === item.id;
           return (
             <button
               key={item.id}
               className={cn(
-                "flex h-10 w-full items-center gap-3 rounded-md px-3 text-left text-sm transition-colors",
-                activeTab === item.id
-                  ? "bg-primary/10 font-medium text-primary"
-                  : "text-muted-foreground hover:bg-secondary hover:text-foreground",
+                "relative flex h-10 w-full items-center gap-3 px-3 text-left font-montserrat text-[11px] font-medium uppercase tracking-[0.08em] transition-colors",
+                active
+                  ? "bg-card text-foreground shadow-soft before:absolute before:inset-y-2 before:left-0 before:w-0.5 before:bg-brand"
+                  : "text-muted-foreground hover:bg-card/60 hover:text-foreground",
               )}
               onClick={() => onTabChange(item.id)}
             >
-              <Icon className="h-4 w-4" />
+              <Icon className={cn("h-4 w-4", active && "text-brand")} />
               {item.label}
             </button>
           );
         })}
       </nav>
+      <div className="border-t border-border p-3">
+        <div className="flex items-center gap-3 px-2 py-2">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand-ink font-montserrat text-xs font-medium uppercase text-white">
+            {userLabel.charAt(0)}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-xs font-medium" title={userLabel}>{userLabel}</div>
+            <div className="text-[11px] text-muted-foreground">Signed in</div>
+          </div>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-2 w-full"
+          disabled={signingOut}
+          onClick={onSignOut}
+        >
+          {signingOut ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogOut className="h-4 w-4" />}
+          {signingOut ? "Signing out…" : "Sign out"}
+        </Button>
+      </div>
     </aside>
   );
 }
@@ -1168,6 +1403,7 @@ function DriveToolbar({
   syncing,
   onSync,
   breadcrumbs,
+  summary,
   onBreadcrumbSelect,
   onRefresh,
 }: {
@@ -1178,29 +1414,53 @@ function DriveToolbar({
   syncing: boolean;
   onSync: () => void;
   breadcrumbs: FolderCrumb[];
+  summary: string;
   onBreadcrumbSelect: (index: number) => void;
   onRefresh: () => void;
 }) {
+  // Long paths collapse to: Root › … › parent › current
+  const visibleCrumbs = breadcrumbs.length > 4
+    ? [0, -1, breadcrumbs.length - 2, breadcrumbs.length - 1]
+    : breadcrumbs.map((_, index) => index);
+
   return (
     <div className="flex h-[72px] items-center justify-between border-b border-border px-5">
-      <div className="min-w-0">
-        <div className="flex max-w-[460px] items-center gap-1 overflow-hidden text-sm text-muted-foreground">
-          {breadcrumbs.map((crumb, index) => (
-            <div key={`${crumb.driveItemId ?? "root"}-${index}`} className="flex min-w-0 items-center gap-1">
-              {index > 0 ? <ChevronRight className="h-3 w-3 shrink-0" /> : null}
-              <button
-                className={cn(
-                  "truncate rounded-sm px-1 py-0.5 hover:bg-secondary hover:text-foreground",
-                  index === breadcrumbs.length - 1 && "font-medium text-foreground",
-                )}
-                onClick={() => onBreadcrumbSelect(index)}
-              >
-                {crumb.name}
-              </button>
-            </div>
-          ))}
-        </div>
-        <div className="mt-1 text-xs text-muted-foreground">Folders open in-place · files preview on the right</div>
+      <div className="min-w-0 flex-1 pr-4">
+        <nav aria-label="Folder path" className="flex min-w-0 items-center gap-0.5 text-sm text-muted-foreground">
+          {visibleCrumbs.map((index, position) => {
+            if (index === -1) {
+              return (
+                <span key="ellipsis" className="flex shrink-0 items-center gap-0.5">
+                  <ChevronRight className="h-3.5 w-3.5 text-brand-line" />
+                  <span className="px-1">…</span>
+                </span>
+              );
+            }
+            const crumb = breadcrumbs[index];
+            const isCurrent = index === breadcrumbs.length - 1;
+            return (
+              <span key={`${crumb.driveItemId ?? "root"}-${index}`} className="flex min-w-0 items-center gap-0.5">
+                {position > 0 ? <ChevronRight className="h-3.5 w-3.5 shrink-0 text-brand-line" /> : null}
+                <button
+                  className={cn(
+                    "flex min-w-0 items-center gap-1.5 px-1.5 py-1 transition-colors",
+                    isCurrent
+                      ? "cursor-default font-medium text-foreground"
+                      : "hover:bg-secondary hover:text-foreground",
+                  )}
+                  aria-current={isCurrent ? "page" : undefined}
+                  disabled={isCurrent}
+                  onClick={() => onBreadcrumbSelect(index)}
+                  title={crumb.name}
+                >
+                  {index === 0 ? <HomeIcon className="h-3.5 w-3.5 shrink-0" /> : null}
+                  <span className="max-w-[180px] truncate">{crumb.name}</span>
+                </button>
+              </span>
+            );
+          })}
+        </nav>
+        <div className="mt-0.5 pl-1.5 text-xs text-muted-foreground">{summary}</div>
       </div>
       <div className="flex items-center gap-2">
         <div className="relative w-[280px]">
@@ -1401,7 +1661,7 @@ function ModelContent({
     return (
       <div className="flex items-center justify-center p-10">
         <div className="max-w-md rounded-md border border-dashed border-border p-6 text-center">
-          <Folder className="mx-auto mb-3 h-8 w-8 text-muted-foreground" />
+          <FolderGlyph className="mx-auto mb-3 h-10" />
           <div className="font-medium">No items in this folder</div>
           <p className="mt-1 text-sm text-muted-foreground">
             Upload files using the Upload button or drag & drop.
@@ -1414,7 +1674,7 @@ function ModelContent({
   return (
     <section className="min-w-0 p-5">
       {viewMode === "grid" ? (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(190px,1fr))] gap-4">
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
           {items.map((item) => (
             <ModelCard
               key={item.id}
@@ -1449,7 +1709,6 @@ function ModelContent({
 }
 
 function ModelCard({
-
   item,
   isPreview,
   onOpen,
@@ -1467,7 +1726,21 @@ function ModelCard({
   onDelete: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const publicUrl = item.thumbnailUrl ?? (item.type === "file" ? createBrowserSupabaseClient()?.storage.from(MODEL_BUCKET).getPublicUrl(item.path).data?.publicUrl ?? null : null);
+  const meta = item.sizeBytes !== null ? `${item.updatedAt ? formatDate(item.updatedAt) : "Storage"} · ${formatBytes(item.sizeBytes)}` : item.updatedAt ? formatDate(item.updatedAt) : "Folder";
+
+  function showCopied() {
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  }
+
+  async function copyText(value: string | null) {
+    if (!value) return;
+    await navigator.clipboard.writeText(value);
+    showCopied();
+  }
 
   // Close menu when clicking outside
   useEffect(() => {
@@ -1484,23 +1757,27 @@ function ModelCard({
   return (
     <article
       className={cn(
-        "relative overflow-hidden rounded-md border border-border bg-card shadow-sm transition-shadow hover:shadow-md",
-        isPreview && "ring-2 ring-primary",
+        "group relative flex flex-col rounded-card bg-card p-2 transition focus-within:shadow-[0_6px_24px_rgba(28,28,28,0.08)] hover:bg-card hover:shadow-[0_6px_24px_rgba(28,28,28,0.08)]",
+        isPreview && "bg-card ring-1 ring-primary",
       )}
     >
-      <button className="relative block aspect-[4/3] w-full overflow-hidden bg-secondary" onClick={onOpen}>
-        {item.thumbnailUrl ? (
+      <button
+        className="relative flex aspect-[4/3] w-full select-none items-center justify-center overflow-hidden rounded-tile border border-border bg-card"
+        title={item.type === "folder" ? "Double-click to open" : "Click to preview"}
+        {...previewOpenHandlers(onPreview, onOpen)}
+      >
+        {item.type === "folder" ? (
+          <div className="flex h-full items-center justify-center">
+            <FolderGlyph className="h-16 transition-transform duration-300 group-hover:scale-110" />
+          </div>
+        ) : item.thumbnailUrl ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={item.thumbnailUrl}
             alt={item.name}
             loading="lazy"
-            className="h-full w-full object-cover transition-transform duration-200 hover:scale-105"
+            className="h-full w-full object-cover"
           />
-        ) : item.type === "folder" ? (
-          <div className="flex h-full items-center justify-center">
-            <Folder className="h-12 w-12 text-amber-500" />
-          </div>
         ) : item.mimeType?.startsWith("video/") ? (
           <div className="flex h-full items-center justify-center">
             <Film className="h-10 w-10 text-muted-foreground" />
@@ -1511,20 +1788,23 @@ function ModelCard({
           </div>
         )}
       </button>
-      <div className="space-y-1.5 p-3">
-        <button className="line-clamp-2 min-h-10 w-full text-left text-sm font-medium" onClick={onOpen}>
+      <div className="flex flex-1 flex-col">
+        <button className="mt-3 line-clamp-1 w-full select-none text-center text-sm font-medium" title={item.name} {...previewOpenHandlers(onPreview, onOpen)}>
           {item.name}
         </button>
-        <div className="flex items-center justify-between">
-          <span className="text-xs text-muted-foreground capitalize">
-            {item.type}{item.sizeBytes !== null ? ` · ${formatBytes(item.sizeBytes)}` : ""}
-          </span>
+        <div className="relative mt-1 h-8">
+          <div className={cn("flex h-8 items-center justify-center truncate text-xs text-muted-foreground transition-opacity group-focus-within:opacity-0 group-hover:opacity-0", isPreview && "opacity-0")}>
+            {copied ? "Copied" : meta}
+          </div>
+          <div className={cn("absolute inset-0 flex items-center justify-center gap-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100", isPreview && "opacity-100")}>
           {/* ··· context menu */}
           <div ref={menuRef} className="relative">
             <Button
               variant="ghost"
               size="icon"
+              className="h-8 w-8 rounded-full hover:bg-secondary"
               title="More options"
+              aria-label="More options"
               onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); }}
             >
               <MoreHorizontal className="h-4 w-4" />
@@ -1558,7 +1838,7 @@ function ModelCard({
                     className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-secondary"
                     onClick={() => { onOpen(); setMenuOpen(false); }}
                   >
-                    <Folder className="h-3.5 w-3.5" /> Open
+                    <FolderGlyph className="h-3.5" /> Open
                   </button>
                 )}
                 <div className="my-1 border-t border-border" />
@@ -1570,6 +1850,16 @@ function ModelCard({
                 </button>
               </div>
             )}
+          </div>
+            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-secondary" title="Copy path" aria-label="Copy path" onClick={() => void copyText(item.path)}>
+              <Copy className="h-4 w-4" />
+            </Button>
+            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-secondary" title="Copy link" aria-label="Copy link" disabled={!publicUrl} onClick={() => void copyText(publicUrl)}>
+              <Link className="h-4 w-4" />
+            </Button>
+            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-secondary" title="Open link" aria-label="Open link" disabled={!publicUrl} onClick={() => publicUrl ? window.open(publicUrl, "_blank", "noopener") : undefined}>
+              <Share2 className="h-4 w-4" />
+            </Button>
           </div>
         </div>
       </div>
@@ -1597,7 +1887,7 @@ function ModelRow({
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const isFolder = item.type === "folder";
-  const Icon = isFolder ? Folder : item.mimeType?.startsWith("video/") ? Film : item.mimeType?.startsWith("image/") ? FileImage : File;
+  const Icon = item.mimeType?.startsWith("video/") ? Film : item.mimeType?.startsWith("image/") ? FileImage : File;
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -1615,8 +1905,8 @@ function ModelRow({
         isPreview && "bg-primary/5",
       )}
     >
-      <button className="flex min-w-0 items-center gap-3 text-left" onClick={onOpen}>
-        <Icon className={cn("h-4 w-4 shrink-0", isFolder ? "text-amber-500" : "text-muted-foreground")} />
+      <button className="flex min-w-0 select-none items-center gap-3 text-left" {...previewOpenHandlers(onPreview, onOpen)}>
+        {isFolder ? <FolderGlyph className="h-4 shrink-0" /> : <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />}
         <span className="truncate text-sm font-medium">{item.name}</span>
       </button>
       <span className="text-xs capitalize text-muted-foreground">{item.type}</span>
@@ -1670,7 +1960,13 @@ function ModelRow({
   );
 }
 
-function ModelPreviewPanel({ item }: { item: StorageItem | null }) {
+function ModelPreviewPanel({
+  item,
+  onOpenFolder,
+}: {
+  item: StorageItem | null;
+  onOpenFolder: (folder: StorageItem) => void;
+}) {
   // Compute public URL synchronously — bucket BAartworkShopify is PUBLIC
   // For images: thumbnailUrl is already computed during loadStorageItems
   // For video/audio: compute here inline
@@ -1694,9 +1990,13 @@ function ModelPreviewPanel({ item }: { item: StorageItem | null }) {
     return (
       <aside className="bg-card p-5">
         <div className="rounded-md border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-          <Folder className="mx-auto mb-3 h-8 w-8 text-amber-500" />
+          <FolderGlyph className="mx-auto mb-3 h-10" />
           <div className="font-medium">{item.name}</div>
-          <p className="mt-1">Click the folder card to open it.</p>
+          <Button className="mt-4 w-full" onClick={() => onOpenFolder(item)}>
+            <FolderOpen className="h-4 w-4" />
+            Open folder
+          </Button>
+          <p className="mt-2 text-xs">Tip: double-click a folder to open it</p>
         </div>
       </aside>
     );
@@ -1938,7 +2238,7 @@ function ModelPickerDialog({
             </div>
           ) : items.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center text-muted-foreground">
-              <Folder className="mb-2 h-12 w-12" />
+              <FolderGlyph className="mb-2 h-10" />
               <p>Empty folder</p>
             </div>
           ) : (
@@ -1963,7 +2263,7 @@ function ModelPickerDialog({
                   >
                     {item.type === "folder" ? (
                       <div className="flex h-full w-full flex-col items-center justify-center bg-secondary/50">
-                        <Folder className="mb-2 h-10 w-10 text-amber-500" />
+                        <FolderGlyph className="mb-2 h-10" />
                         <span className="truncate px-2 text-center text-xs font-medium w-full">{item.name}</span>
                       </div>
                     ) : item.thumbnailUrl ? (
@@ -2017,48 +2317,116 @@ function ModelPickerDialog({
 
 
 function FolderTree({
-
-  activeFolderDriveId,
-  folders,
-  onRootSelect,
-  onFolderSelect,
+  rootChildren,
+  folderChildren,
+  expanded,
+  currentKey,
+  loadingKeys,
+  onNavigate,
+  onToggle,
 }: {
-  activeFolderDriveId: string | null;
-  folders: DriveItem[];
-
-  onRootSelect: () => void;
-  onFolderSelect: (folder: DriveItem) => void;
+  rootChildren: DriveItem[];
+  folderChildren: Record<string, DriveItem[]>;
+  expanded: Set<string>;
+  currentKey: string;
+  loadingKeys: Set<string>;
+  onNavigate: (key: string) => void;
+  onToggle: (key: string) => void;
 }) {
-  return (
-    <aside className="border-r border-border bg-secondary/40 p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <span className="text-xs font-semibold uppercase text-muted-foreground">Folders</span>
+  function renderNode(item: DriveItem, depth: number) {
+    const key = getFolderKeyFromItem(item);
+    const children = folderChildren[key];
+    const isExpanded = expanded.has(key);
+    const isCurrent = currentKey === key;
+    const isLoading = loadingKeys.has(key);
+    const hasKnownNoChildren = children?.length === 0;
+
+    return (
+      <div key={key}>
+        <div
+          className={cn(
+            "relative flex h-8 w-full items-center gap-1.5 rounded-tile pr-2 text-left text-sm transition-colors hover:bg-card",
+            isCurrent
+              ? "bg-card font-medium text-brand-dark before:absolute before:inset-y-1.5 before:left-0 before:w-0.5 before:bg-primary"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+          style={{ paddingLeft: 8 + depth * 16 }}
+          title={item.name}
+        >
+          <button
+            type="button"
+            className={cn("flex h-5 w-5 shrink-0 items-center justify-center", hasKnownNoChildren && "invisible")}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggle(key);
+            }}
+            aria-label={isExpanded ? `Collapse ${item.name}` : `Expand ${item.name}`}
+          >
+            {isLoading ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", isExpanded && "rotate-90")} />
+            )}
+          </button>
+          <button
+            type="button"
+            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+            onClick={() => {
+              onNavigate(key);
+              if (!isExpanded) onToggle(key);
+            }}
+          >
+            <FolderGlyph className="h-4 shrink-0" />
+            <span className="truncate">{item.name}</span>
+          </button>
+        </div>
+        {isExpanded && children?.length ? children.map((child) => renderNode(child, depth + 1)) : null}
+        {isExpanded && hasKnownNoChildren ? (
+          <div className="h-8 py-1 text-xs italic text-muted-foreground" style={{ paddingLeft: 8 + (depth + 1) * 16 }}>
+            No subfolders
+          </div>
+        ) : null}
       </div>
-      <button
-        onClick={onRootSelect}
+    );
+  }
+
+  return (
+    <aside className="overflow-auto border-r border-border bg-brand-cream/50 px-3 py-4">
+      <div className="mb-2 px-2 font-montserrat text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+        Folders
+      </div>
+      <div
         className={cn(
-          "flex h-9 w-full items-center gap-2 rounded-md px-2 text-left text-sm hover:bg-background",
-          activeFolderDriveId === null ? "bg-background font-medium text-primary" : "",
+          "relative flex h-8 w-full items-center gap-2 rounded-tile pr-2 text-left text-sm transition-colors hover:bg-card",
+          currentKey === "root"
+            ? "bg-card font-medium text-brand-dark before:absolute before:inset-y-1.5 before:left-0 before:w-0.5 before:bg-primary"
+            : "text-muted-foreground hover:text-foreground",
         )}
         style={{ paddingLeft: 8 }}
       >
-        <Folder className="h-4 w-4 text-amber-600" />
-        <span className="truncate">Root folder</span>
-      </button>
-      {folders.map((folder) => (
         <button
-          key={folder.id}
-          onClick={() => onFolderSelect(folder)}
-          className={cn(
-            "flex h-9 w-full items-center gap-2 rounded-md px-2 text-left text-sm hover:bg-background",
-            activeFolderDriveId === folder.driveItemId ? "bg-background font-medium text-primary" : "",
-          )}
-          style={{ paddingLeft: 8 + 14 }}
+          type="button"
+          className="flex h-5 w-5 shrink-0 items-center justify-center"
+          onClick={(event) => {
+            event.stopPropagation();
+            onToggle("root");
+          }}
+          aria-label={expanded.has("root") ? "Collapse root" : "Expand root"}
         >
-          <Folder className="h-4 w-4 text-amber-600" />
-          <span className="truncate">{folder.name}</span>
+          <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", expanded.has("root") && "rotate-90")} />
         </button>
-      ))}
+        <button type="button" className="flex min-w-0 flex-1 items-center gap-2 text-left" onClick={() => onNavigate("root")}>
+          <HomeIcon className="h-4 w-4 shrink-0" />
+          <span className="truncate">Root folder</span>
+        </button>
+      </div>
+      {expanded.has("root") ? (
+        rootChildren.length ? rootChildren.map((child) => renderNode(child, 1)) : (
+          <div className="h-8 py-1 text-xs italic text-muted-foreground" style={{ paddingLeft: 24 }}>
+            No subfolders
+          </div>
+        )
+      ) : null}
     </aside>
   );
 }
@@ -2066,6 +2434,7 @@ function FolderTree({
 function DriveContent({
   items,
   selectedItem,
+  previewItem,
   onSelect,
   onPreview,
   onOpen,
@@ -2075,6 +2444,7 @@ function DriveContent({
 }: {
   items: DriveItem[];
   selectedItem: DriveItem | null;
+  previewItem: DriveItem | null;
   onSelect: (id: string) => void;
   onPreview: (item: DriveItem) => void;
   onOpen: (item: DriveItem) => void;
@@ -2114,7 +2484,7 @@ function DriveContent({
     return (
       <div className="flex items-center justify-center p-10">
         <div className="max-w-md rounded-md border border-dashed border-border p-6 text-center">
-          <FolderSync className="mx-auto mb-3 h-8 w-8 text-muted-foreground" />
+          <FolderGlyph className="mx-auto mb-3 h-10" />
           <div className="font-medium">No Drive metadata yet</div>
           <p className="mt-1 text-sm text-muted-foreground">
             Run Drive Sync to load Google Drive metadata into Supabase.
@@ -2133,6 +2503,7 @@ function DriveContent({
               key={item.id}
               item={item}
               selected={selectedItem?.id === item.id}
+              previewed={previewItem?.id === item.id}
               onSelect={() => onSelect(item.id)}
               onPreview={() => onPreview(item)}
               onOpen={() => onOpen(item)}
@@ -2146,6 +2517,7 @@ function DriveContent({
               key={item.id}
               item={item}
               selected={selectedItem?.id === item.id}
+              previewed={previewItem?.id === item.id}
               onSelect={() => onSelect(item.id)}
               onPreview={() => onPreview(item)}
               onOpen={() => onOpen(item)}
@@ -2160,60 +2532,89 @@ function DriveContent({
 function MediaCard({
   item,
   selected,
+  previewed,
   onSelect,
   onPreview,
   onOpen,
 }: {
   item: DriveItem;
   selected: boolean;
+  previewed: boolean;
   onSelect: () => void;
   onPreview: () => void;
   onOpen: () => void;
 }) {
   const Icon = typeIcon[item.itemType];
+  const isFolder = item.itemType === "FOLDER";
+  const [copied, setCopied] = useState(false);
+  const meta = isFolder ? formatDate(item.modifiedTime) : `${formatDate(item.modifiedTime)} · ${formatBytes(item.sizeBytes)}`;
+  const driveLink = stripMarkdownLink(item.webViewLink);
+
+  function showCopied() {
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  }
+
+  async function copyText(value: string | null) {
+    if (!value) return;
+    await navigator.clipboard.writeText(value);
+    showCopied();
+  }
 
   return (
-    <article className={cn("relative overflow-hidden rounded-md border border-border bg-card shadow-sm", selected && "ring-2 ring-primary")}>
-      <button className="relative block aspect-[4/3] w-full bg-secondary" onClick={onOpen}>
-        {item.thumbnailUrl ? (
+    <article
+      className={cn(
+        "group relative flex flex-col rounded-card bg-card p-2 transition focus-within:shadow-[0_6px_24px_rgba(28,28,28,0.08)] hover:bg-card hover:shadow-[0_6px_24px_rgba(28,28,28,0.08)]",
+        selected ? "ring-1 ring-primary" : previewed && "ring-1 ring-brand-line shadow-[0_6px_24px_rgba(28,28,28,0.08)]",
+      )}
+    >
+      <button
+        className="relative flex aspect-[4/3] select-none items-center justify-center overflow-hidden rounded-tile border border-border bg-card"
+        title={isFolder ? "Double-click to open" : "Double-click to preview"}
+        {...previewOpenHandlers(onPreview, onOpen)}
+      >
+        {/* Drive's folder thumbnails are blurry generic icons — always use our glyph. */}
+        {isFolder ? (
+          <FolderGlyph className="h-16 transition-transform duration-300 group-hover:scale-110" />
+        ) : item.thumbnailUrl ? (
           <Image src={item.thumbnailUrl} alt="" fill sizes="260px" className="object-cover" />
         ) : (
-          <div className="flex h-full items-center justify-center">
-            <Icon className="h-10 w-10 text-muted-foreground" />
-          </div>
+          <Icon className="h-10 w-10 text-muted-foreground" />
         )}
+        {item.syncStatus === "STALE" ? <span className="absolute bottom-3 left-3 h-2 w-2 rounded-full bg-amber-500" /> : null}
       </button>
       <button
         className={cn(
-          "absolute left-3 top-3 flex h-5 w-5 items-center justify-center rounded-sm border bg-card",
-          selected ? "border-primary bg-primary text-primary-foreground" : "border-border",
+          "absolute right-4 top-4 flex h-5 w-5 items-center justify-center rounded-[4px] border-2 bg-card transition-opacity",
+          selected
+            ? "border-primary bg-primary text-primary-foreground opacity-100"
+            : "border-muted-foreground/60 opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
         )}
         onClick={(e) => {
           e.stopPropagation();
           onSelect();
         }}
-        title={item.itemType === "FOLDER" ? "Select folder" : "Select file"}
+        title={isFolder ? "Select folder" : "Select file"}
+        aria-pressed={selected}
       >
         {selected ? <Check className="h-3.5 w-3.5" /> : null}
       </button>
-      <div className="space-y-3 p-3">
-        <button className="line-clamp-2 min-h-10 text-left text-sm font-medium" onClick={onOpen}>
+      <div className="flex flex-1 flex-col">
+        <button className="mt-3 line-clamp-1 select-none text-center text-sm font-medium hover:text-brand-dark" title={item.name} {...previewOpenHandlers(onPreview, onOpen)}>
           {item.name}
         </button>
-        {item.treePath && item.treePath.length > 1 ? (
-          <div className="truncate text-xs text-muted-foreground" title={item.treePath.join(" / ")}>
-            {item.treePath.slice(0, -1).join(" / ")}
+        <div className="relative mt-1 h-8">
+          <div className={cn("flex h-8 items-center justify-center truncate text-xs text-muted-foreground transition-opacity group-focus-within:opacity-0 group-hover:opacity-0", selected && "opacity-0")}>
+            {copied ? "Copied" : meta}
           </div>
-        ) : null}
-        <div className="flex items-center justify-between text-xs text-muted-foreground">
-          <span>{formatBytes(item.sizeBytes)}</span>
-          <Badge variant={item.cacheStatus === "CACHED" ? "success" : "neutral"}>{item.cacheStatus}</Badge>
-        </div>
-        <div className="flex items-center justify-between">
-          <Badge variant={item.syncStatus === "STALE" ? "warning" : "success"}>{item.syncStatus}</Badge>
-          <Button variant="ghost" size="icon" title="Preview metadata" onClick={onPreview}>
-            <MoreHorizontal className="h-4 w-4" />
-          </Button>
+          <div className={cn("absolute inset-0 flex items-center justify-center gap-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100", selected && "opacity-100")}>
+            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-secondary" title="Copy Google Drive link" aria-label="Copy Google Drive link" disabled={!driveLink} onClick={() => void copyText(driveLink)}>
+              <Link className="h-4 w-4" />
+            </Button>
+            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-secondary" title="Open Google Drive link" aria-label="Open Google Drive link" disabled={!driveLink} onClick={() => driveLink ? window.open(driveLink, "_blank", "noopener") : undefined}>
+              <Share2 className="h-4 w-4" />
+            </Button>
+          </div>
         </div>
       </div>
     </article>
@@ -2223,14 +2624,16 @@ function MediaCard({
 function MediaRow(props: {
   item: DriveItem;
   selected: boolean;
+  previewed: boolean;
   onSelect: () => void;
   onPreview: () => void;
   onOpen: () => void;
 }) {
   const Icon = typeIcon[props.item.itemType];
+  const isFolder = props.item.itemType === "FOLDER";
 
   return (
-    <div className={cn("grid grid-cols-[40px_minmax(0,1fr)_130px_120px_120px_44px] items-center border-b border-border px-3 py-2.5 last:border-b-0", props.selected && "bg-primary/5")}>
+    <div className={cn("grid grid-cols-[40px_minmax(0,1fr)_130px_120px_120px_44px] items-center border-b border-border px-3 py-2.5 last:border-b-0", props.selected ? "bg-primary/5" : props.previewed && "bg-secondary")}>
       <button
         className={cn(
           "flex h-5 w-5 items-center justify-center rounded-sm border",
@@ -2245,11 +2648,12 @@ function MediaRow(props: {
         {props.selected ? <Check className="h-3.5 w-3.5" /> : null}
       </button>
       <button
-        className="flex min-w-0 items-center gap-3 text-left"
-        onClick={props.onOpen}
+        className="flex min-w-0 select-none items-center gap-3 text-left"
+        title={isFolder ? "Double-click to open" : undefined}
+        {...previewOpenHandlers(props.onPreview, props.onOpen)}
         style={{ paddingLeft: Math.min(props.item.treeDepth ?? 0, 8) * 14 }}
       >
-        <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+        {isFolder ? <FolderGlyph className="h-4 shrink-0" /> : <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />}
         <span className="min-w-0">
           <span className="block truncate text-sm font-medium">{props.item.name}</span>
           {props.item.treePath && props.item.treePath.length > 1 ? (
@@ -2293,6 +2697,7 @@ function PreviewDrawer({
   setVideoResolution,
   submitting,
   onSubmit,
+  onOpenFolder,
 }: {
   item: DriveItem | null;
   selectedItem: DriveItem | null;
@@ -2317,6 +2722,7 @@ function PreviewDrawer({
   setVideoResolution: (value: string) => void;
   submitting: boolean;
   onSubmit: () => void;
+  onOpenFolder: (folder: DriveItem) => void;
 }) {
   if (!selectedItem && !item) {
     return (
@@ -2479,6 +2885,24 @@ function PreviewDrawer({
         </Button>
 
         {/* File Preview (if a file is selected) */}
+        </div>
+      ) : null}
+
+      {displayItem && displayItem.itemType === "FOLDER" ? (
+        <div className={cn("pt-4", selectedItem && "border-t border-border")}>
+          <div className="flex aspect-video items-center justify-center rounded-tile border border-border bg-brand-cream/50">
+            <FolderGlyph className="h-16" />
+          </div>
+          <div className="mt-4 text-sm font-medium">{displayItem.name}</div>
+          <div className="mt-3 space-y-3">
+            <Info label="Modified" value={formatDate(displayItem.modifiedTime)} />
+            <Info label="Sync" value={displayItem.syncStatus} />
+          </div>
+          <Button className="mt-4 w-full" onClick={() => onOpenFolder(displayItem)}>
+            <FolderOpen className="h-4 w-4" />
+            Open folder
+          </Button>
+          <p className="mt-2 text-center text-xs text-muted-foreground">Tip: double-click a folder to open it</p>
         </div>
       ) : null}
 
@@ -2683,7 +3107,6 @@ function FinalPage({
   setCustomToDate: (value: string) => void;
   onRefresh: () => void;
 }) {
-  const latestRun = runs[0];
   const filterOptions: Array<{ id: FinalDateFilter; label: string }> = [
     { id: "all", label: "All" },
     { id: "today", label: "Today" },
@@ -2697,25 +3120,6 @@ function FinalPage({
       <div className="mb-5">
         <h2 className="text-lg font-semibold">Final</h2>
         <p className="text-sm text-muted-foreground">Generated files in BAartworkShopify / baartwork / runs</p>
-      </div>
-
-      <div className="mb-5 grid grid-cols-3 gap-4">
-        <div className="rounded-md border border-border bg-card p-4">
-          <div className="text-2xl font-semibold">{files.length}</div>
-          <div className="text-xs text-muted-foreground">Total files</div>
-        </div>
-        <div className="rounded-md border border-border bg-card p-4">
-          <div className="text-2xl font-semibold">{runs.length}</div>
-          <div className="text-xs text-muted-foreground">Total runs</div>
-        </div>
-        <div className="rounded-md border border-border bg-card p-4">
-          <div className="truncate text-2xl font-semibold" title={latestRun?.run_id}>
-            {latestRun ? latestRun.run_id.slice(0, 8) : "-"}
-          </div>
-          <div className="text-xs text-muted-foreground">
-            {latestRun ? `${latestRun.file_count} latest run files` : "Latest run"}
-          </div>
-        </div>
       </div>
 
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
@@ -2823,15 +3227,32 @@ function FinalPage({
   );
 }
 
+// Drive "view" links are HTML pages, not images — map them to Drive's thumbnail endpoint.
+function thumbnailSrc(url: string): string {
+  const driveId = url.match(/drive\.google\.com\/file\/d\/([^/?#]+)/)?.[1]
+    ?? (url.includes("drive.google.com") ? new URL(url).searchParams.get("id") : null);
+  return driveId ? `https://drive.google.com/thumbnail?id=${driveId}&sz=w200` : url;
+}
+
 function FinalFileRow({ file, onOpen }: { file: FinalFile; onOpen: () => void }) {
   const isImage = file.mime_type?.startsWith("image/");
   const isVideo = file.mime_type?.startsWith("video/");
+  const [thumbFailed, setThumbFailed] = useState(false);
 
   return (
     <div className="grid grid-cols-[82px_minmax(180px,1.4fr)_minmax(180px,1fr)_140px_120px_96px] items-center border-b border-border px-3 py-2.5 last:border-b-0">
       <button className="relative block h-14 w-14 overflow-hidden rounded-md bg-secondary" onClick={onOpen}>
-        {isImage && file.signed_url ? (
-          <Image src={file.signed_url} alt="" fill sizes="56px" className="object-cover" />
+        {isImage && file.signed_url && !thumbFailed ? (
+          // Plain <img>: sources span Supabase signed URLs and Drive, not all whitelisted for next/image.
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={thumbnailSrc(file.signed_url)}
+            alt=""
+            loading="lazy"
+            referrerPolicy="no-referrer"
+            className="h-full w-full object-cover"
+            onError={() => setThumbFailed(true)}
+          />
         ) : (
           <div className="flex h-full items-center justify-center">
             {isVideo ? <Film className="h-5 w-5 text-muted-foreground" /> : <ImageIcon className="h-5 w-5 text-muted-foreground" />}

@@ -296,6 +296,7 @@ export function normalizeDriveItem(item: ApiDriveItem): DriveItem {
     syncedAt: item.updated_at ?? item.created_at ?? new Date().toISOString(),
     syncStatus: item.sync_status === "ERROR" ? "ERROR" : item.sync_status === "STALE" ? "STALE" : "SYNCED",
     cacheStatus: item.cached_storage_path ? "CACHED" : "NOT_CACHED",
+    storagePath: item.cached_storage_path ?? null,
     treeDepth: item.tree_depth,
     treePath: item.tree_path,
   };
