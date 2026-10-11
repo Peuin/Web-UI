@@ -2,7 +2,7 @@
 
 import {
   ArrowLeft,
-  BellRing,
+  BookOpen,
   Check,
   ChevronRight,
   CircleAlert,
@@ -955,7 +955,6 @@ export default function Home() {
           <TopBar
             modelLibrary={activeTab === "model"}
             selectedItem={selectedItem}
-            onRunWorkflow={submitWorkflow}
           />
 
           {/* ── Drive Browser tab ─────────────────────────────────────── */}
@@ -1191,11 +1190,9 @@ function AppSidebar({
 function TopBar({
   modelLibrary = false,
   selectedItem,
-  onRunWorkflow,
 }: {
   modelLibrary?: boolean;
   selectedItem: DriveItem | null;
-  onRunWorkflow: () => void;
 }) {
   return (
     <header className="flex min-h-16 min-w-0 flex-wrap items-center justify-between gap-3 border-b border-border bg-card px-5 py-3">
@@ -1206,14 +1203,15 @@ function TopBar({
         </p>
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        <Button variant="outline" size="sm">
-          <BellRing className="h-4 w-4" />
-          Events
+        <Button
+          variant="outline"
+          size="sm"
+          title="Open the user guide — English / Tiếng Việt (new tab)"
+          onClick={() => window.open("/user-guide.html", "_blank", "noopener,noreferrer")}
+        >
+          <BookOpen className="h-4 w-4" />
+          User Guide
         </Button>
-        {!modelLibrary ? <Button size="sm" disabled={!selectedItem} onClick={onRunWorkflow}>
-          <Sparkles className="h-4 w-4" />
-          Generate Media
-        </Button> : null}
       </div>
     </header>
   );

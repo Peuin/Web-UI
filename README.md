@@ -36,3 +36,15 @@ Do not put server secrets in `NEXT_PUBLIC_` variables.
 - Integration Settings screen for Supabase, n8n, secrets and external API contracts
 
 The UI does not ship crawled/mock file records. It loads Drive metadata and workflow jobs from Supabase Edge Functions.
+
+## User guide
+
+The header's **User Guide** button opens `/user-guide.html` in a new tab. The
+English/Vietnamese guide is bundled in `public/user-guide.html`, including its
+screenshots, so it is available in both development and production.
+
+After rebuilding the guide, update the bundled copy from the `Web-UI` directory:
+
+```sh
+cp ../docs/userguide/media-workflow-userguide.html public/user-guide.html
+```
