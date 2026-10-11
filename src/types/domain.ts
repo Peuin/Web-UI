@@ -53,6 +53,20 @@ export type ApiDriveItem = {
   tree_path?: string[];
 };
 
+/** Image or folder in the Google Drive model library (n8n Production_07). */
+export type ModelLibraryItem = {
+  id: string;
+  name: string;
+  mime_type: string;
+  item_type: "FOLDER" | "IMAGE" | "OTHER";
+  size_bytes: number | null;
+  thumbnail_url: string | null;
+  web_view_link: string | null;
+  modified_time: string | null;
+  /** Direct "anyone with the link" URL; only valid after the file is shared. */
+  public_url: string | null;
+};
+
 export type WorkflowStatus =
   | "QUEUED"
   | "PROCESSING"

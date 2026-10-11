@@ -60,3 +60,33 @@ select {
 ::selection {
   background: hsl(var(--brand) / 0.2);
 }
+
+/* Use the same responsive card layout as Drive Browser. */
+.final-output-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 190px), 240px));
+}
+
+.final-output-grid .folder-card-icon,
+.final-output-grid .group:hover .folder-card-icon {
+  transform: none;
+}
+
+@keyframes workflow-sweep {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(390%); }
+}
+
+@keyframes workflow-stripes {
+  to { background-position: 1rem 0; }
+}
+
+.workflow-progress-sweep { animation: workflow-sweep 1.8s ease-in-out infinite; }
+.workflow-progress-stripes {
+  background-image: repeating-linear-gradient(115deg, transparent 0, transparent 6px, rgb(255 255 255 / 25%) 6px, rgb(255 255 255 / 25%) 12px);
+  background-size: 1rem 100%;
+  animation: workflow-stripes 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workflow-progress-sweep, .workflow-progress-stripes { animation: none; }
+}

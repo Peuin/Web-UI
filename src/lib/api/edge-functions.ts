@@ -7,6 +7,7 @@ import type {
   DriveItem,
   FinalFilesResponse,
   WorkflowJob,
+  ModelLibraryItem,
 } from "@/types/domain";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -236,6 +237,51 @@ export const platformApi = {
       method: "POST",
       body: JSON.stringify(filters || {}),
     });
+  },
+  /** Model library on Google Drive (via n8n Production_07). */
+  listModelLibrary(accessToken: string, folderId?: string) {
+    return callEdgeFunction<{ folder_id: string; items: ModelLibraryItem[] }>("model-library", accessToken, {
+      method: "POST",
+      body: JSON.stringify({ action: "list", folder_id: folderId }),
+    });
+  },
+  /** Makes one library image readable by "anyone with the link" and returns it. */
+  shareModelImage(accessToken: string, fileId: string, folderId: string) {
+    return callEdgeFunction<{ item: ModelLibraryItem }>("model-library", accessToken, {
+      method: "POST",
+      body: JSON.stringify({ action: "share", file_id: fileId, folder_id: folderId }),
+    });
+  },
+  uploadModelImage(
+    accessToken: string,
+    file: { fileName: string; mimeType: string; contentBase64: string; folderId: string },
+  ) {
+    return callEdgeFunction<{ item: ModelLibraryItem }>("model-library", accessToken, {
+      method: "POST",
+      body: JSON.stringify({
+        action: "upload",
+        folder_id: file.folderId,
+        file_name: file.fileName,
+        mime_type: file.mimeType,
+        content_base64: file.contentBase64,
+      }),
+    });
+  },
+  /** Final Output tab: one folder's children from final_items. */
+  listFinalFolder(accessToken: string, folderId: string) {
+    return callEdgeFunction<{ folder_id: string; folder: ApiDriveItem | null; items: ApiDriveItem[] }>(
+      "final-files",
+      accessToken,
+      { method: "POST", body: JSON.stringify({ action: "list", folder_id: folderId }) },
+    );
+  },
+  /** Ask n8n (Production_05) to re-list one output folder into final_items. */
+  syncFinalFolder(accessToken: string, folderId: string) {
+    return callEdgeFunction<{ status: string; folder_id: string; n8n_response?: unknown }>(
+      "final-files",
+      accessToken,
+      { method: "POST", body: JSON.stringify({ action: "sync", folder_id: folderId }) },
+    );
   },
   submitMediaGenerationWorkflow(
     accessToken: string,

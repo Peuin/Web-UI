@@ -27,27 +27,25 @@ import {
   MoreHorizontal,
   PanelRightClose,
   PanelRightOpen,
-  Pencil,
   Play,
   RefreshCw,
   Search,
   Share2,
   ShieldCheck,
   Sparkles,
-  Trash2,
   UploadCloud,
   Workflow,
   X,
   ImageIcon,
 } from "lucide-react";
 import Image from "next/image";
+import { workflowErrorMessage } from "@/lib/utils/workflow-error";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LoginScreen } from "@/components/auth/login-screen";
-import { Badge } from "@/components/ui/badge";
 import { FolderGlyph } from "@/components/ui/folder-glyph";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Progress } from "@/components/ui/progress";
+import { WorkflowProgress, WorkflowStatusBadge } from "@/components/ui/workflow-status";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -62,11 +60,9 @@ import type {
   ApiDriveItem,
   DriveItem,
   DriveItemType,
-  StorageBreadcrumb,
-  StorageItem,
   JobFolderRun,
   WorkflowJob,
-  WorkflowStatus,
+  ModelLibraryItem,
 } from "@/types/domain";
 
 type ViewMode = "grid" | "list";
@@ -89,10 +85,11 @@ const DRIVE_ROOT_FOLDER_ID = "1vP62rBKIsfZGPZy7TXHsRwQLdO7pJ4W2";
 // Generated output root (output_config.folder_id → "02_AI_PROCESSING").
 const FINAL_ROOT_FOLDER_ID = "1RFEes48Mrjcxq5axaifu-i-OmChch6Bb";
 const FINAL_ROOT_FOLDER_NAME = "02_AI_PROCESSING";
+// Model reference library on Google Drive (n8n Production_07).
+const MODEL_LIBRARY_ROOT_ID = "1lyx87c6tZPE74wHnahta2ByvxR8u52l-";
+const MODEL_LIBRARY_MAX_BYTES = 15 * 1024 * 1024;
 
 // Model tab — Supabase Storage constants
-const MODEL_BUCKET = "BAartworkShopify";
-const MODEL_ROOT_PATH = "google-drive/Model";
 // Storage folder mirroring the Drive root (see drive-list-folder DEFAULT_ROOT_PATH)
 const DRIVE_STORAGE_ROOT = "google-drive/01_New_Product_Raw";
 
@@ -104,14 +101,6 @@ const typeIcon: Record<DriveItemType, typeof File> = {
   OTHER: File,
 };
 
-const statusVariant: Record<WorkflowStatus, "neutral" | "success" | "warning" | "danger" | "info"> = {
-  QUEUED: "neutral",
-  PROCESSING: "info",
-  WAITING_EXTERNAL: "warning",
-  COMPLETED: "success",
-  FAILED: "danger",
-  CANCELLED: "neutral",
-};
 
 function isHiddenDrivePlaceholder(item: { name: string }): boolean {
   return item.name === ".emptyFolderPlaceholder";
@@ -164,7 +153,9 @@ function validateReferenceImageUrl(label: string, value: string | null): string 
     return `${label} must be a valid URL.`;
   }
   if (url.protocol !== "https:") return `${label} must be a public HTTPS link.`;
-  if (/(^|\.)(drive|docs)\.google\.com$/.test(url.hostname)) {
+  // Drive direct links (uc?export=view&id=…) from the model library are fine; preview pages are not.
+  const isDriveDirectLink = url.hostname === "drive.google.com" && url.pathname === "/uc" && url.searchParams.has("id");
+  if (/(^|\.)(drive|docs)\.google\.com$/.test(url.hostname) && !isDriveDirectLink) {
     return `${label} must link directly to an image, not a Google Drive preview.`;
   }
   return null;
@@ -243,29 +234,8 @@ export default function Home() {
   const [loadingJobs, setLoadingJobs] = useState(false);
   const [appError, setAppError] = useState<string | null>(null);
 
-  // ── Model tab state (Supabase Storage, no Google Drive) ───────────────────
-  const [modelPath, setModelPath] = useState(MODEL_ROOT_PATH);
-  const [modelItems, setModelItems] = useState<StorageItem[]>([]);
-  const [modelLoading, setModelLoading] = useState(false);
-  const [modelError, setModelError] = useState<string | null>(null);
-  const [modelPreviewItem, setModelPreviewItem] = useState<StorageItem | null>(null);
-  const [modelQuery, setModelQuery] = useState("");
-  // ── Model CRUD state ──────────────────────────────────────────
-  const [modelUploading, setModelUploading] = useState(false);
-  const [modelDeleteItem, setModelDeleteItem] = useState<StorageItem | null>(null);
-  const [modelDeleteLoading, setModelDeleteLoading] = useState(false);
-  const [modelRenameItem, setModelRenameItem] = useState<StorageItem | null>(null);
-  const [modelRenameName, setModelRenameName] = useState("");
-  const [modelRenameLoading, setModelRenameLoading] = useState(false);
-  const modelFileInputRef = useRef<HTMLInputElement>(null);
-  // ── Drag-and-drop state ───────────────────────────────────────
-  const [modelDragOver, setModelDragOver] = useState(false);
-  // ── Model Picker dialog (for Model Reference URL) ──────────────────────────
-  const [modelPickerOpen, setModelPickerOpen] = useState(false);
-  const [modelPickerPath, setModelPickerPath] = useState(MODEL_ROOT_PATH);
-  const [modelPickerItems, setModelPickerItems] = useState<StorageItem[]>([]);
-  const [modelPickerLoading, setModelPickerLoading] = useState(false);
-  const [modelPickerSelected, setModelPickerSelected] = useState<StorageItem | null>(null);
+  // Model Reference picker (Google Drive model library via n8n)
+  const [driveModelPickerOpen, setDriveModelPickerOpen] = useState(false);
 
   const [syncing, setSyncing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -303,25 +273,6 @@ export default function Home() {
     const fileCount = filteredItems.length - folderCount;
     return `${folderCount} ${folderCount === 1 ? "folder" : "folders"} · ${fileCount} ${fileCount === 1 ? "file" : "files"}`;
   }, [filteredItems]);
-
-  // ── Model breadcrumbs — computed from modelPath string ─────────────────────
-  const modelBreadcrumbs = useMemo<StorageBreadcrumb[]>(() => {
-    // modelPath = "google-drive/Model/Folder A/Folder B"
-    // Remove "google-drive/" prefix so display starts at "Model"
-    const relative = modelPath.replace(/^google-drive\//, "");
-    const parts = relative.split("/");
-    return parts.map((part, i) => ({
-      label: part,
-      path: "google-drive/" + parts.slice(0, i + 1).join("/"),
-    }));
-  }, [modelPath]);
-
-  // ── Model filtered items — search within current Storage path only ─────────
-  const modelFilteredItems = useMemo(() => {
-    const normalized = modelQuery.trim().toLowerCase();
-    if (!normalized) return modelItems;
-    return modelItems.filter((item) => item.name.toLowerCase().includes(normalized));
-  }, [modelItems, modelQuery]);
 
   const listDriveFolder = useCallback(async (
     token: string,
@@ -518,58 +469,6 @@ export default function Home() {
       : null);
   }, [buildCrumbs, expandAncestors, fetchDriveFolder, storeFolderChildren]);
 
-  // ── Model tab: load from Supabase Storage directly — no Drive API ──────────
-  const loadStorageItems = useCallback(async (path: string) => {
-    const supabase = createBrowserSupabaseClient();
-    if (!supabase) return;
-
-    setModelLoading(true);
-    setModelError(null);
-
-    const { data, error } = await supabase.storage
-      .from(MODEL_BUCKET)
-      .list(path, {
-        limit: 500,
-        offset: 0,
-        sortBy: { column: "name", order: "asc" },
-      });
-
-    setModelLoading(false);
-
-    if (error) {
-      console.error("Storage list error:", error);
-      setModelError(error.message);
-      return;
-    }
-
-    const mapped: StorageItem[] = (data ?? [])
-      .filter((item) => item.name !== ".emptyFolderPlaceholder")
-      .map((item) => {
-        const filePath = `${path}/${item.name}`;
-        const mimeType = (item.metadata?.mimetype as string) ?? null;
-        const isImageFile = !!item.metadata && mimeType?.startsWith("image/");
-
-        // getPublicUrl is synchronous — safe for public bucket (BAartworkShopify is PUBLIC)
-        const thumbnailUrl = isImageFile
-          ? (supabase.storage.from(MODEL_BUCKET).getPublicUrl(filePath).data?.publicUrl ?? null)
-          : null;
-
-        return {
-          id: item.name,
-          name: item.name,
-          path: filePath,
-          // Supabase Storage: metadata is null for folders, object for files
-          type: (item.metadata ? "file" : "folder") as "file" | "folder",
-          mimeType,
-          sizeBytes: (item.metadata?.size as number) ?? null,
-          updatedAt: (item.updated_at as string) ?? null,
-          metadata: (item.metadata as Record<string, unknown>) ?? null,
-          thumbnailUrl,
-        };
-      });
-
-    setModelItems(mapped);
-  }, []);
 
 
   const loadJobs = useCallback(async (token: string) => {
@@ -608,14 +507,6 @@ export default function Home() {
     }
   }, [previewPanelOpen]);
 
-  // ── Trigger Model Storage load when modelPath or activeTab changes ─────────
-  useEffect(() => {
-    if (activeTab === "model") {
-      queueMicrotask(() => {
-        void loadStorageItems(modelPath);
-      });
-    }
-  }, [modelPath, activeTab, loadStorageItems]);
 
   useEffect(() => {
     if (!isSignedIn) return;
@@ -830,152 +721,12 @@ export default function Home() {
 
   function switchTab(tab: WorkspaceTab) {
     setActiveTab(tab);
-    if (tab === "model") {
-      // Reset Model to root — useEffect will trigger loadStorageItems
-      setModelPath(MODEL_ROOT_PATH);
-      setModelPreviewItem(null);
-      setModelQuery("");
-    }
     // Returning to Drive Browser preserves its folder, selection and form.
   }
 
-  function openModelItem(item: StorageItem) {
-    if (item.type === "folder") {
-      setModelPath(item.path);
-      setModelQuery("");
-    } else {
-      setModelPreviewItem(item);
-    }
-  }
 
-  // ── Model CRUD functions ──────────────────────────────────────────
 
-  async function uploadToModel(files: FileList | null) {
-    if (!files || files.length === 0) return;
-    const supabase = createBrowserSupabaseClient();
-    if (!supabase) return;
-    setModelUploading(true);
-    for (const file of Array.from(files)) {
-      const destPath = `${modelPath}/${file.name}`;
-      await supabase.storage.from(MODEL_BUCKET).upload(destPath, file, { upsert: true });
-    }
-    setModelUploading(false);
-    // Reset file input so same file can be picked again
-    if (modelFileInputRef.current) modelFileInputRef.current.value = "";
-    void loadStorageItems(modelPath);
-  }
 
-  async function deleteModelItem() {
-    const item = modelDeleteItem;
-    if (!item) return;
-    const supabase = createBrowserSupabaseClient();
-    if (!supabase) return;
-    setModelDeleteLoading(true);
-    if (item.type === "file") {
-      await supabase.storage.from(MODEL_BUCKET).remove([item.path]);
-    } else {
-      // Only delete empty folders — Supabase has no folder API,
-      // so attempt to remove the hidden placeholder or nothing and let list confirm empty
-      const { data: children } = await supabase.storage.from(MODEL_BUCKET).list(item.path, { limit: 10 });
-      const realChildren = (children ?? []).filter(c => c.name !== ".emptyFolderPlaceholder");
-      if (realChildren.length > 0) {
-        setModelDeleteLoading(false);
-        setModelDeleteItem(null);
-        setModelError(`Cannot delete "${item.name}": folder is not empty (${realChildren.length} item${realChildren.length > 1 ? "s" : ""} inside).`);
-        return;
-      }
-      // Delete the placeholder if exists
-      await supabase.storage.from(MODEL_BUCKET).remove([`${item.path}/.emptyFolderPlaceholder`]);
-    }
-    setModelDeleteLoading(false);
-    setModelDeleteItem(null);
-    if (modelPreviewItem?.id === item.id) setModelPreviewItem(null);
-    void loadStorageItems(modelPath);
-  }
-
-  async function renameModelItem() {
-    const item = modelRenameItem;
-    const newName = modelRenameName.trim();
-    if (!item || !newName || newName === item.name) { setModelRenameItem(null); return; }
-    const supabase = createBrowserSupabaseClient();
-    if (!supabase) return;
-    setModelRenameLoading(true);
-    // Compute parent path = everything in item.path before the last slash
-    const parentPath = item.path.substring(0, item.path.lastIndexOf("/"));
-    const newPath = `${parentPath}/${newName}`;
-    await supabase.storage.from(MODEL_BUCKET).move(item.path, newPath);
-    setModelRenameLoading(false);
-    setModelRenameItem(null);
-    if (modelPreviewItem?.id === item.id) setModelPreviewItem(null);
-    void loadStorageItems(modelPath);
-  }
-
-  function downloadModelItem(item: StorageItem) {
-    const supabase = createBrowserSupabaseClient();
-    if (!supabase) return;
-    const { data } = supabase.storage.from(MODEL_BUCKET).getPublicUrl(item.path);
-    if (data?.publicUrl) {
-      const a = document.createElement("a");
-      a.href = data.publicUrl;
-      a.download = item.name;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-    }
-  }
-
-  // ── Model Picker dialog functions ──────────────────────────────────────────
-
-  async function loadPickerItems(path: string) {
-    const supabase = createBrowserSupabaseClient();
-    if (!supabase) return;
-    setModelPickerLoading(true);
-    const { data, error } = await supabase.storage
-      .from(MODEL_BUCKET)
-      .list(path, { limit: 500, sortBy: { column: "name", order: "asc" } });
-    setModelPickerLoading(false);
-    if (error || !data) return;
-    const mapped: StorageItem[] = data
-      .filter((item) => item.name !== ".emptyFolderPlaceholder")
-      .map((item) => {
-        const filePath = `${path}/${item.name}`;
-        const mimeType = (item.metadata?.mimetype as string) ?? null;
-        const isImageFile = !!item.metadata && mimeType?.startsWith("image/");
-        const thumbnailUrl = isImageFile
-          ? (supabase.storage.from(MODEL_BUCKET).getPublicUrl(filePath).data?.publicUrl ?? null)
-          : null;
-        return {
-          id: item.name,
-          name: item.name,
-          path: filePath,
-          type: (item.metadata ? "file" : "folder") as "file" | "folder",
-          mimeType,
-          sizeBytes: (item.metadata?.size as number) ?? null,
-          updatedAt: (item.updated_at as string) ?? null,
-          metadata: (item.metadata as Record<string, unknown>) ?? null,
-          thumbnailUrl,
-        };
-      });
-    setModelPickerItems(mapped);
-  }
-
-  function openModelPicker() {
-    setModelPickerOpen(true);
-    setModelPickerPath(MODEL_ROOT_PATH);
-    setModelPickerSelected(null);
-    void loadPickerItems(MODEL_ROOT_PATH);
-  }
-
-  function confirmModelPicker() {
-    if (!modelPickerSelected) return;
-    const supabase = createBrowserSupabaseClient();
-    if (!supabase) return;
-    const { data } = supabase.storage.from(MODEL_BUCKET).getPublicUrl(modelPickerSelected.path);
-    if (data?.publicUrl) {
-      setModelReferenceUrl(data.publicUrl);
-    }
-    setModelPickerOpen(false);
-  }
 
   function selectBreadcrumb(index: number) {
     if (!accessToken) return;
@@ -1202,6 +953,7 @@ export default function Home() {
         />
         <section className="flex min-w-0 flex-col">
           <TopBar
+            modelLibrary={activeTab === "model"}
             selectedItem={selectedItem}
             onRunWorkflow={submitWorkflow}
           />
@@ -1290,7 +1042,7 @@ export default function Home() {
                 styleReferenceUrl={styleReferenceUrl}
                 setStyleReferenceUrl={setStyleReferenceUrl}
                 submitNotice={submitNotice}
-                onOpenModelPicker={openModelPicker}
+                onOpenModelPicker={() => setDriveModelPickerOpen(true)}
                 outputType={outputType}
                 setOutputType={setOutputType}
                 imageCount={imageCount}
@@ -1309,92 +1061,12 @@ export default function Home() {
             </div>
           ) : null}
 
-          {/* ── Model tab (Supabase Storage, no Google Drive) ─────────── */}
-          {activeTab === "model" ? (
-            <div className="relative grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_360px]">
-              {/* Hidden file input for upload */}
-              <input
-                ref={modelFileInputRef}
-                type="file"
-                multiple
-                className="hidden"
-                onChange={(e) => void uploadToModel(e.target.files)}
-              />
-
-              <div
-                className={cn(
-                  "relative min-w-0 border-r border-border",
-                  modelDragOver && "ring-2 ring-primary ring-inset",
-                )}
-                onDragOver={(e) => { e.preventDefault(); setModelDragOver(true); }}
-                onDragLeave={() => setModelDragOver(false)}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  setModelDragOver(false);
-                  void uploadToModel(e.dataTransfer.files);
-                }}
-              >
-                {/* Drag overlay */}
-                {modelDragOver && (
-                  <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-sm bg-primary/10">
-                    <div className="rounded-md border-2 border-dashed border-primary bg-background px-8 py-6 text-center shadow-lg">
-                      <UploadCloud className="mx-auto mb-2 h-8 w-8 text-primary" />
-                      <div className="font-semibold text-primary">Drop files to upload</div>
-                    </div>
-                  </div>
-                )}
-
-                <ModelToolbar
-                  query={modelQuery}
-                  setQuery={setModelQuery}
-                  viewMode={viewMode}
-                  setViewMode={setViewMode}
-                  breadcrumbs={modelBreadcrumbs}
-                  rootPath={MODEL_ROOT_PATH}
-                  onBreadcrumbSelect={(path) => setModelPath(path)}
-                  onRefresh={() => void loadStorageItems(modelPath)}
-                  uploading={modelUploading}
-                  onUpload={() => modelFileInputRef.current?.click()}
-                />
-                <ModelContent
-                  items={modelFilteredItems}
-                  previewItem={modelPreviewItem}
-                  onOpen={openModelItem}
-                  onPreview={setModelPreviewItem}
-                  onDownload={downloadModelItem}
-                  onRename={(item) => { setModelRenameItem(item); setModelRenameName(item.name); }}
-                  onDelete={(item) => setModelDeleteItem(item)}
-                  viewMode={viewMode}
-                  loading={modelLoading}
-                  error={modelError}
-                />
-              </div>
-              <ModelPreviewPanel item={modelPreviewItem} onOpenFolder={openModelItem} />
-
-              {/* ── Rename dialog ── */}
-              {modelRenameItem ? (
-                <ModelRenameDialog
-                  item={modelRenameItem}
-                  name={modelRenameName}
-                  onNameChange={setModelRenameName}
-                  onConfirm={() => void renameModelItem()}
-                  onCancel={() => setModelRenameItem(null)}
-                  loading={modelRenameLoading}
-                />
-              ) : null}
-
-              {/* ── Delete dialog ── */}
-              {modelDeleteItem ? (
-                <ModelDeleteDialog
-                  item={modelDeleteItem}
-                  onConfirm={() => void deleteModelItem()}
-                  onCancel={() => setModelDeleteItem(null)}
-                  loading={modelDeleteLoading}
-                />
-              ) : null}
+          {/* ── Model tab: model reference library on Google Drive (via n8n) ─ */}
+          {activeTab === "model" && accessToken ? (
+            <div className="flex min-h-0 flex-1 flex-col">
+              <ModelLibraryPanel accessToken={accessToken} mode="page" />
             </div>
           ) : null}
-
 
           {activeTab === "jobs" ? (
             <JobsPage
@@ -1416,19 +1088,17 @@ export default function Home() {
       </div>
 
       {/* ── Model Picker dialog ── */}
-      {modelPickerOpen ? (
-        <ModelPickerDialog
-          path={modelPickerPath}
-          setPath={setModelPickerPath}
-          items={modelPickerItems}
-          loading={modelPickerLoading}
-          selected={modelPickerSelected}
-          onSelect={setModelPickerSelected}
-          onConfirm={confirmModelPicker}
-          onCancel={() => setModelPickerOpen(false)}
-          onRefresh={() => void loadPickerItems(modelPickerPath)}
+      {driveModelPickerOpen && accessToken ? (
+        <DriveModelPickerDialog
+          accessToken={accessToken}
+          onPick={(url) => {
+            setModelReferenceUrl(url);
+            setDriveModelPickerOpen(false);
+          }}
+          onCancel={() => setDriveModelPickerOpen(false)}
         />
       ) : null}
+
     </main>
   );
 }
@@ -1519,18 +1189,20 @@ function AppSidebar({
 }
 
 function TopBar({
+  modelLibrary = false,
   selectedItem,
   onRunWorkflow,
 }: {
+  modelLibrary?: boolean;
   selectedItem: DriveItem | null;
   onRunWorkflow: () => void;
 }) {
   return (
     <header className="flex min-h-16 min-w-0 flex-wrap items-center justify-between gap-3 border-b border-border bg-card px-5 py-3">
       <div className="min-w-0 flex-1 basis-60">
-        <h2 className="text-base font-semibold">Creative source media</h2>
+        <h2 className="text-base font-semibold">{modelLibrary ? "Model Library" : "Creative source media"}</h2>
         <p className="truncate text-xs text-muted-foreground" title={selectedItem?.name}>
-          {selectedItem ? `${selectedItem.itemType === 'FOLDER' ? 'Folder' : 'File'} selected: ${selectedItem.name}` : 'Select a file or folder to generate media'}
+          {modelLibrary ? "Manage reference images for your media" : selectedItem ? `${selectedItem.itemType === 'FOLDER' ? 'Folder' : 'File'} selected: ${selectedItem.name}` : 'Select a file or folder to generate media'}
         </p>
       </div>
       <div className="flex shrink-0 items-center gap-2">
@@ -1538,10 +1210,10 @@ function TopBar({
           <BellRing className="h-4 w-4" />
           Events
         </Button>
-        <Button size="sm" disabled={!selectedItem} onClick={onRunWorkflow}>
+        {!modelLibrary ? <Button size="sm" disabled={!selectedItem} onClick={onRunWorkflow}>
           <Sparkles className="h-4 w-4" />
           Generate Media
-        </Button>
+        </Button> : null}
       </div>
     </header>
   );
@@ -1689,817 +1361,368 @@ function DriveToolbar({
 
 // ─── Model tab components (Supabase Storage) ───────────────────────────────────
 
-function ModelToolbar({
-  query,
-  setQuery,
-  viewMode,
-  setViewMode,
-  breadcrumbs,
-  rootPath,
-  onBreadcrumbSelect,
-  onRefresh,
-  uploading,
-  onUpload,
-}: {
-  query: string;
-  setQuery: (value: string) => void;
-  viewMode: ViewMode;
-  setViewMode: (mode: ViewMode) => void;
-  breadcrumbs: StorageBreadcrumb[];
-  rootPath: string;
-  onBreadcrumbSelect: (path: string) => void;
-  onRefresh: () => void;
-  uploading: boolean;
-  onUpload: () => void;
-}) {
-  return (
-    <div className="flex h-[72px] items-center justify-between border-b border-border px-5">
-      <div className="min-w-0">
-        <div className="flex max-w-[460px] items-center gap-1 overflow-hidden text-sm text-muted-foreground">
-          {breadcrumbs.map((crumb, index) => (
-            <div key={crumb.path} className="flex min-w-0 items-center gap-1">
-              {index > 0 ? <ChevronRight className="h-3 w-3 shrink-0" /> : null}
-              <button
-                className={cn(
-                  "truncate rounded-sm px-1 py-0.5 hover:bg-secondary hover:text-foreground",
-                  index === 0 && crumb.path === rootPath
-                    ? "cursor-default font-medium text-foreground"
-                    : index === breadcrumbs.length - 1
-                      ? "font-medium text-foreground"
-                      : "cursor-pointer",
-                )}
-                onClick={() => {
-                  if (crumb.path === rootPath && index === 0 && breadcrumbs.length === 1) return;
-                  onBreadcrumbSelect(crumb.path);
-                }}
-                disabled={index === breadcrumbs.length - 1}
-              >
-                {crumb.label}
-              </button>
-            </div>
-          ))}
-        </div>
-        <div className="mt-1 text-xs text-muted-foreground">
-          Drag & drop to upload · click files to preview
-        </div>
-      </div>
-      <div className="flex items-center gap-2">
-        <div className="relative w-[220px]">
-          <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-          <Input
-            className="pl-8"
-            placeholder="Search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-          />
-        </div>
-        <Button
-          variant="default"
-          className="gap-1.5"
-          onClick={onUpload}
-          disabled={uploading}
-          title="Upload files to current folder"
-        >
-          {uploading ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <UploadCloud className="h-4 w-4" />
-          )}
-          {uploading ? "Uploading…" : "Upload"}
-        </Button>
-        <Button variant="outline" size="icon" title="Refresh" onClick={onRefresh}>
-          <RefreshCw className="h-4 w-4" />
-        </Button>
-        <div className="flex rounded-md border border-border bg-background p-0.5">
-          <Button
-            variant={viewMode === "grid" ? "secondary" : "ghost"}
-            size="icon"
-            onClick={() => setViewMode("grid")}
-            title="Grid view"
-          >
-            <Grid2X2 className="h-4 w-4" />
-          </Button>
-          <Button
-            variant={viewMode === "list" ? "secondary" : "ghost"}
-            size="icon"
-            onClick={() => setViewMode("list")}
-            title="List view"
-          >
-            <List className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
-    </div>
-  );
-}
 
-function ModelContent({
-  items,
-  previewItem,
-  onOpen,
-  onPreview,
-  onDownload,
-  onRename,
-  onDelete,
-  viewMode,
-  loading,
-  error,
-}: {
-  items: StorageItem[];
-  previewItem: StorageItem | null;
-  onOpen: (item: StorageItem) => void;
-  onPreview: (item: StorageItem) => void;
-  onDownload: (item: StorageItem) => void;
-  onRename: (item: StorageItem) => void;
-  onDelete: (item: StorageItem) => void;
-  viewMode: ViewMode;
-  loading: boolean;
-  error: string | null;
-}) {
-  if (loading) {
-    return (
-      <section className="grid grid-cols-[repeat(auto-fill,minmax(190px,1fr))] gap-4 p-5">
-        {Array.from({ length: 8 }).map((_, index) => (
-          <div key={index} className="h-[220px] animate-pulse rounded-md border border-border bg-card">
-            <div className="h-32 bg-muted" />
-            <div className="space-y-3 p-3">
-              <div className="h-4 rounded-sm bg-muted" />
-              <div className="h-4 w-2/3 rounded-sm bg-muted" />
-            </div>
-          </div>
-        ))}
-      </section>
-    );
-  }
 
-  if (error) {
-    return (
-      <div className="flex items-center justify-center p-10">
-        <div className="max-w-md rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-          <CircleAlert className="mb-2 h-4 w-4" />
-          {error}
-        </div>
-      </div>
-    );
-  }
-
-  if (items.length === 0) {
-    return (
-      <div className="flex items-center justify-center p-10">
-        <div className="max-w-md rounded-md border border-dashed border-border p-6 text-center">
-          <FolderGlyph className="mx-auto mb-3 h-10" />
-          <div className="font-medium">No items in this folder</div>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Upload files using the Upload button or drag & drop.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <section className="min-w-0 p-5">
-      {viewMode === "grid" ? (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
-          {items.map((item) => (
-            <ModelCard
-              key={item.id}
-              item={item}
-              isPreview={previewItem?.id === item.id}
-              onOpen={() => onOpen(item)}
-              onPreview={() => onPreview(item)}
-              onDownload={() => onDownload(item)}
-              onRename={() => onRename(item)}
-              onDelete={() => onDelete(item)}
-            />
-          ))}
-        </div>
-      ) : (
-        <div className="overflow-hidden rounded-md border border-border bg-card">
-          {items.map((item) => (
-            <ModelRow
-              key={item.id}
-              item={item}
-              isPreview={previewItem?.id === item.id}
-              onOpen={() => onOpen(item)}
-              onPreview={() => onPreview(item)}
-              onDownload={() => onDownload(item)}
-              onRename={() => onRename(item)}
-              onDelete={() => onDelete(item)}
-            />
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function ModelCard({
-  item,
-  isPreview,
-  onOpen,
-  onPreview,
-  onDownload,
-  onRename,
-  onDelete,
-}: {
-  item: StorageItem;
-  isPreview: boolean;
-  onOpen: () => void;
-  onPreview: () => void;
-  onDownload: () => void;
-  onRename: () => void;
-  onDelete: () => void;
-}) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const menuRef = useRef<HTMLDivElement>(null);
-  const publicUrl = item.thumbnailUrl ?? (item.type === "file" ? createBrowserSupabaseClient()?.storage.from(MODEL_BUCKET).getPublicUrl(item.path).data?.publicUrl ?? null : null);
-  const meta = item.sizeBytes !== null ? `${item.updatedAt ? formatDate(item.updatedAt) : "Storage"} · ${formatBytes(item.sizeBytes)}` : item.updatedAt ? formatDate(item.updatedAt) : "Folder";
-
-  function showCopied() {
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
-  }
-
-  async function copyText(value: string | null) {
-    if (!value) return;
-    await navigator.clipboard.writeText(value);
-    showCopied();
-  }
-
-  // Close menu when clicking outside
-  useEffect(() => {
-    if (!menuOpen) return;
-    function handler(e: MouseEvent) {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setMenuOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [menuOpen]);
-
-  return (
-    <article
-      className={cn(
-        "group relative flex flex-col rounded-card bg-card p-2 transition focus-within:shadow-[0_6px_24px_rgba(28,28,28,0.08)] hover:bg-card hover:shadow-[0_6px_24px_rgba(28,28,28,0.08)]",
-        isPreview && "bg-card ring-1 ring-primary",
-      )}
-    >
-      <button
-        className="relative flex aspect-[4/3] w-full select-none items-center justify-center overflow-hidden rounded-tile border border-border bg-card"
-        title={item.type === "folder" ? "Double-click to open" : "Click to preview"}
-        {...previewOpenHandlers(onPreview, onOpen)}
-      >
-        {item.type === "folder" ? (
-          <div className="flex h-full items-center justify-center">
-            <FolderGlyph className="h-16 transition-transform duration-300 group-hover:scale-110" />
-          </div>
-        ) : item.thumbnailUrl ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={item.thumbnailUrl}
-            alt={item.name}
-            loading="lazy"
-            className="h-full w-full object-cover"
-          />
-        ) : item.mimeType?.startsWith("video/") ? (
-          <div className="flex h-full items-center justify-center">
-            <Film className="h-10 w-10 text-muted-foreground" />
-          </div>
-        ) : (
-          <div className="flex h-full items-center justify-center">
-            <File className="h-10 w-10 text-muted-foreground" />
-          </div>
-        )}
-      </button>
-      <div className="flex flex-1 flex-col">
-        <button className="mt-3 line-clamp-1 w-full select-none text-center text-sm font-medium" title={item.name} {...previewOpenHandlers(onPreview, onOpen)}>
-          {item.name}
-        </button>
-        <div className="relative mt-1 h-8">
-          <div className={cn("flex h-8 items-center justify-center truncate text-xs text-muted-foreground transition-opacity group-focus-within:opacity-0 group-hover:opacity-0", isPreview && "opacity-0")}>
-            {copied ? "Copied" : meta}
-          </div>
-          <div className={cn("absolute inset-0 flex items-center justify-center gap-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100", isPreview && "opacity-100")}>
-          {/* ··· context menu */}
-          <div ref={menuRef} className="relative">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8 rounded-full hover:bg-secondary"
-              title="More options"
-              aria-label="More options"
-              onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); }}
-            >
-              <MoreHorizontal className="h-4 w-4" />
-            </Button>
-            {menuOpen && (
-              <div className="absolute right-0 bottom-full z-50 mb-1 min-w-[140px] overflow-hidden rounded-md border border-border bg-card shadow-lg">
-                {item.type === "file" && (
-                  <>
-                    <button
-                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-secondary"
-                      onClick={() => { onPreview(); setMenuOpen(false); }}
-                    >
-                      <FileImage className="h-3.5 w-3.5" /> Preview
-                    </button>
-                    <button
-                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-secondary"
-                      onClick={() => { onDownload(); setMenuOpen(false); }}
-                    >
-                      <Download className="h-3.5 w-3.5" /> Download
-                    </button>
-                    <button
-                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-secondary"
-                      onClick={() => { onRename(); setMenuOpen(false); }}
-                    >
-                      <Pencil className="h-3.5 w-3.5" /> Rename
-                    </button>
-                  </>
-                )}
-                {item.type === "folder" && (
-                  <button
-                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-secondary"
-                    onClick={() => { onOpen(); setMenuOpen(false); }}
-                  >
-                    <FolderGlyph className="h-3.5" /> Open
-                  </button>
-                )}
-                <div className="my-1 border-t border-border" />
-                <button
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
-                  onClick={() => { onDelete(); setMenuOpen(false); }}
-                >
-                  <Trash2 className="h-3.5 w-3.5" /> Delete
-                </button>
-              </div>
-            )}
-          </div>
-            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-secondary" title="Copy path" aria-label="Copy path" onClick={() => void copyText(item.path)}>
-              <Copy className="h-4 w-4" />
-            </Button>
-            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-secondary" title="Copy link" aria-label="Copy link" disabled={!publicUrl} onClick={() => void copyText(publicUrl)}>
-              <Link className="h-4 w-4" />
-            </Button>
-            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-secondary" title="Open link" aria-label="Open link" disabled={!publicUrl} onClick={() => publicUrl ? window.open(publicUrl, "_blank", "noopener") : undefined}>
-              <Share2 className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-      </div>
-    </article>
-  );
-}
-
-function ModelRow({
-  item,
-  isPreview,
-  onOpen,
-  onPreview,
-  onDownload,
-  onRename,
-  onDelete,
-}: {
-  item: StorageItem;
-  isPreview: boolean;
-  onOpen: () => void;
-  onPreview: () => void;
-  onDownload: () => void;
-  onRename: () => void;
-  onDelete: () => void;
-}) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const menuRef = useRef<HTMLDivElement>(null);
-  const isFolder = item.type === "folder";
-  const Icon = item.mimeType?.startsWith("video/") ? Film : item.mimeType?.startsWith("image/") ? FileImage : File;
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    function handler(e: MouseEvent) {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
-    }
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [menuOpen]);
-
-  return (
-    <div
-      className={cn(
-        "grid grid-cols-[minmax(0,1fr)_90px_110px_44px] items-center border-b border-border px-4 py-2.5 last:border-b-0",
-        isPreview && "bg-primary/5",
-      )}
-    >
-      <button className="flex min-w-0 select-none items-center gap-3 text-left" {...previewOpenHandlers(onPreview, onOpen)}>
-        {isFolder ? <FolderGlyph className="h-4 shrink-0" /> : <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />}
-        <span className="truncate text-sm font-medium">{item.name}</span>
-      </button>
-      <span className="text-xs capitalize text-muted-foreground">{item.type}</span>
-      <span className="text-xs text-muted-foreground">
-        {item.sizeBytes !== null ? formatBytes(item.sizeBytes) : "—"}
-      </span>
-      <div ref={menuRef} className="relative flex justify-end">
-        <Button
-          variant="ghost"
-          size="icon"
-          title="More options"
-          onClick={() => setMenuOpen((v) => !v)}
-        >
-          <MoreHorizontal className="h-4 w-4" />
-        </Button>
-        {menuOpen && (
-          <div className="absolute right-0 top-full z-50 mt-1 min-w-[140px] overflow-hidden rounded-md border border-border bg-card shadow-lg">
-            {item.type === "file" && (
-              <>
-                <button
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-secondary"
-                  onClick={() => { onPreview(); setMenuOpen(false); }}
-                >
-                  <FileImage className="h-3.5 w-3.5" /> Preview
-                </button>
-                <button
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-secondary"
-                  onClick={() => { onDownload(); setMenuOpen(false); }}
-                >
-                  <Download className="h-3.5 w-3.5" /> Download
-                </button>
-                <button
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-secondary"
-                  onClick={() => { onRename(); setMenuOpen(false); }}
-                >
-                  <Pencil className="h-3.5 w-3.5" /> Rename
-                </button>
-              </>
-            )}
-            <div className="my-1 border-t border-border" />
-            <button
-              className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
-              onClick={() => { onDelete(); setMenuOpen(false); }}
-            >
-              <Trash2 className="h-3.5 w-3.5" /> Delete
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ModelPreviewPanel({
-  item,
-  onOpenFolder,
-}: {
-  item: StorageItem | null;
-  onOpenFolder: (folder: StorageItem) => void;
-}) {
-  // Compute public URL synchronously — bucket BAartworkShopify is PUBLIC
-  // For images: thumbnailUrl is already computed during loadStorageItems
-  // For video/audio: compute here inline
-  const supabase = createBrowserSupabaseClient();
-  const publicUrl = item?.type === "file" && supabase
-    ? (supabase.storage.from(MODEL_BUCKET).getPublicUrl(item.path).data?.publicUrl ?? null)
-    : null;
-
-  if (!item) {
-    return (
-      <aside className="bg-card p-5">
-        <div className="rounded-md border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-          <File className="mx-auto mb-3 h-8 w-8" />
-          Click a file to preview it here.
-        </div>
-      </aside>
-    );
-  }
-
-  if (item.type === "folder") {
-    return (
-      <aside className="bg-card p-5">
-        <div className="rounded-md border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-          <FolderGlyph className="mx-auto mb-3 h-10" />
-          <div className="font-medium">{item.name}</div>
-          <Button className="mt-4 w-full" onClick={() => onOpenFolder(item)}>
-            <FolderOpen className="h-4 w-4" />
-            Open folder
-          </Button>
-          <p className="mt-2 text-xs">Tip: double-click a folder to open it</p>
-        </div>
-      </aside>
-    );
-  }
-
-  const isImage = item.mimeType?.startsWith("image/");
-  const isVideo = item.mimeType?.startsWith("video/");
-  const isAudio = item.mimeType?.startsWith("audio/");
-
-  // For image: use thumbnailUrl (already computed, same public URL)
-  // For video/audio: use publicUrl computed above
-  const previewUrl = isImage ? item.thumbnailUrl : publicUrl;
-
-  return (
-    <aside className="min-w-0 overflow-auto bg-card p-5">
-      <div className="mb-4 flex items-center justify-between">
-        <h3 className="text-sm font-semibold">File Preview</h3>
-      </div>
-
-      {/* Preview area */}
-      <div className="mb-4 overflow-hidden rounded-md bg-secondary">
-        {previewUrl && isImage ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={previewUrl}
-            alt={item.name}
-            className="max-h-[360px] w-full object-contain"
-          />
-        ) : previewUrl && isVideo ? (
-          <video
-            src={previewUrl}
-            controls
-            className="max-h-[360px] w-full"
-          />
-        ) : previewUrl && isAudio ? (
-          <div className="p-4">
-            <audio src={previewUrl} controls className="w-full" />
-          </div>
-        ) : (
-          <div className="flex aspect-video items-center justify-center">
-            <File className="h-12 w-12 text-muted-foreground" />
-          </div>
-        )}
-      </div>
-
-      {/* File metadata */}
-      <div className="space-y-3">
-        <div>
-          <div className="text-base font-semibold">{item.name}</div>
-          {item.mimeType ? (
-            <div className="mt-1 text-xs text-muted-foreground">{item.mimeType}</div>
-          ) : null}
-        </div>
-        <div className="grid grid-cols-2 gap-3 text-sm">
-          {item.sizeBytes !== null ? (
-            <Info label="Size" value={formatBytes(item.sizeBytes)} />
-          ) : null}
-          <Info label="Type" value={item.type} />
-          {item.updatedAt ? (
-            <Info label="Modified" value={formatDate(item.updatedAt)} />
-          ) : null}
-        </div>
-        {publicUrl ? (
-          <Button
-            variant="outline"
-            className="w-full"
-            onClick={() => window.open(publicUrl, "_blank", "noopener,noreferrer")}
-          >
-            <Link className="h-4 w-4" />
-            Open in new tab
-          </Button>
-        ) : null}
-      </div>
-    </aside>
-  );
-}
 
 // ─── Model CRUD dialogs ─────────────────────────────────────────────────────
 
-function ModelRenameDialog({
-  item,
-  name,
-  onNameChange,
-  onConfirm,
-  onCancel,
-  loading,
-}: {
-  item: StorageItem;
-  name: string;
-  onNameChange: (v: string) => void;
-  onConfirm: () => void;
-  onCancel: () => void;
-  loading: boolean;
-}) {
-  return (
-    <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/40 backdrop-blur-sm">
-      <div className="w-full max-w-sm rounded-lg border border-border bg-card p-6 shadow-xl">
-        <h2 className="mb-1 text-base font-semibold">Rename file</h2>
-        <p className="mb-4 truncate text-sm text-muted-foreground">{item.name}</p>
-        <Input
-          autoFocus
-          value={name}
-          onChange={(e) => onNameChange(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") onConfirm();
-            if (e.key === "Escape") onCancel();
-          }}
-          placeholder="New file name"
-          className="mb-4"
-        />
-        <div className="flex justify-end gap-2">
-          <Button variant="outline" onClick={onCancel} disabled={loading}>
-            Cancel
-          </Button>
-          <Button onClick={onConfirm} disabled={loading || !name.trim() || name === item.name}>
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-            Rename
-          </Button>
-        </div>
-      </div>
-    </div>
-  );
-}
 
-function ModelDeleteDialog({
-  item,
-  onConfirm,
-  onCancel,
-  loading,
-}: {
-  item: StorageItem;
-  onConfirm: () => void;
-  onCancel: () => void;
-  loading: boolean;
-}) {
-  return (
-    <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/40 backdrop-blur-sm">
-      <div className="w-full max-w-sm rounded-lg border border-border bg-card p-6 shadow-xl">
-        <div className="mb-3 flex items-center gap-3">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-red-100">
-            <Trash2 className="h-5 w-5 text-red-600" />
-          </div>
-          <div>
-            <h2 className="text-base font-semibold">
-              Delete {item.type === "folder" ? "folder" : "file"}
-            </h2>
-            <p className="text-sm text-muted-foreground">This action cannot be undone.</p>
-          </div>
-        </div>
-        <div className="mb-4 rounded-md bg-secondary px-3 py-2 text-sm">
-          <span className="font-medium">{item.name}</span>
-          {item.type === "folder" && (
-            <p className="mt-1 text-xs text-muted-foreground">
-              Only empty folders can be deleted. Files inside must be removed first.
-            </p>
-          )}
-        </div>
-        <div className="flex justify-end gap-2">
-          <Button variant="outline" onClick={onCancel} disabled={loading}>
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={onConfirm}
-            disabled={loading}
-          >
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-            Delete
-          </Button>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 // ─── Model Picker Dialog ───────────────────────────────────────────────────
 
-function ModelPickerDialog({
-  path,
-  setPath,
-  items,
-  loading,
-  selected,
-  onSelect,
-  onConfirm,
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).replace(/^data:[^,]*,/, ""));
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Model reference library on Google Drive. Everything goes through the
+ * model-library edge function → n8n Production_07; n8n returns the share link.
+ *  - mode "picker": choose an image for Model Reference URL
+ *  - mode "page":   Model tab (browse, upload, copy/open links)
+ */
+function ModelLibraryPanel({
+  accessToken,
+  mode,
+  onPick,
   onCancel,
-  onRefresh,
 }: {
-  path: string;
-  setPath: (p: string) => void;
-  items: StorageItem[];
-  loading: boolean;
-  selected: StorageItem | null;
-  onSelect: (item: StorageItem | null) => void;
-  onConfirm: () => void;
-  onCancel: () => void;
-  onRefresh: () => void;
+  accessToken: string;
+  mode: "picker" | "page";
+  onPick?: (url: string) => void;
+  onCancel?: () => void;
 }) {
+  const [trail, setTrail] = useState<{ id: string; name: string }[]>([{ id: MODEL_LIBRARY_ROOT_ID, name: "Model library" }]);
+  const [items, setItems] = useState<ModelLibraryItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState<"share" | "upload" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [selected, setSelected] = useState<ModelLibraryItem | null>(null);
+  const [query, setQuery] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>("grid");
+  const [dragOver, setDragOver] = useState(false);
+  const folderId = trail[trail.length - 1].id;
+
+  const load = useCallback(async (id: string) => {
+    setLoading(true);
+    setError(null);
+    setSelected(null);
+    const response = await platformApi.listModelLibrary(accessToken, id);
+    setLoading(false);
+    if (!response.success || !response.data) {
+      setItems([]);
+      setError(response.error?.message ?? "Could not load the model library.");
+      return;
+    }
+    setItems(response.data.items);
+  }, [accessToken]);
+
+  useEffect(() => {
+    queueMicrotask(() => void load(folderId));
+  }, [folderId, load]);
+
+  /** Asks n8n to share the image ("anyone with the link") and returns its link. */
+  async function shareLink(item: ModelLibraryItem): Promise<string | null> {
+    setBusy("share");
+    setError(null);
+    const response = await platformApi.shareModelImage(accessToken, item.id, folderId);
+    setBusy(null);
+    const url = response.data?.item.public_url ?? null;
+    if (!response.success || !url) {
+      setError(response.error?.message ?? "Could not share this image.");
+      // Deleted on Drive since the list loaded: reload so it disappears here too.
+      if (response.error?.code === "MODEL_NOT_FOUND") {
+        setItems((current) => current.filter((candidate) => candidate.id !== item.id));
+        setSelected(null);
+      }
+      return null;
+    }
+    return url;
+  }
+
+  async function pick(item: ModelLibraryItem | null = selected) {
+    if (!item || busy) return;
+    const url = await shareLink(item);
+    if (url) onPick?.(url);
+  }
+
+  async function copyLink(item: ModelLibraryItem) {
+    if (busy) return;
+    const url = await shareLink(item);
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      setNotice(`Copied link for ${item.name}`);
+    } catch {
+      setNotice(url);
+    }
+  }
+
+  async function upload(file: File) {
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      setError("Only JPEG, PNG, or WebP images can be uploaded.");
+      return;
+    }
+    if (file.size > MODEL_LIBRARY_MAX_BYTES) {
+      setError("Image must be 15 MB or smaller.");
+      return;
+    }
+    setBusy("upload");
+    setError(null);
+    setNotice(null);
+    try {
+      const contentBase64 = await readFileAsBase64(file);
+      const response = await platformApi.uploadModelImage(accessToken, {
+        fileName: file.name,
+        mimeType: file.type,
+        contentBase64,
+        folderId,
+      });
+      if (!response.success || !response.data) {
+        setError(response.error?.message ?? "Upload failed.");
+        return;
+      }
+      const uploaded = response.data.item;
+      setItems((current) => [...current.filter((item) => item.id !== uploaded.id), uploaded]);
+      setSelected(uploaded);
+      setNotice(`Uploaded ${uploaded.name} to Google Drive.`);
+    } catch (uploadError) {
+      setError(uploadError instanceof Error ? uploadError.message : "Upload failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const visibleItems = query.trim()
+    ? items.filter((item) => item.name.toLowerCase().includes(query.trim().toLowerCase()))
+    : items;
+
   return (
-    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
-      <div className="flex h-full max-h-[80vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl">
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-border p-4">
-          <div>
-            <h2 className="text-lg font-semibold">Select Model Image</h2>
-            <div className="mt-1 flex items-center gap-1 text-sm text-muted-foreground">
-              {path !== MODEL_ROOT_PATH ? (
+    <div
+      className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col"
+      onDragOver={(event) => {
+        if (!event.dataTransfer.types.includes("Files")) return;
+        event.preventDefault();
+        if (!busy) setDragOver(true);
+      }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragOver(false);
+      }}
+      onDrop={(event) => {
+        event.preventDefault();
+        setDragOver(false);
+        if (busy) return;
+        if (event.dataTransfer.files.length !== 1) {
+          setError("Please upload one reference image at a time.");
+          return;
+        }
+        void upload(event.dataTransfer.files[0]);
+      }}
+    >
+      {dragOver ? <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center border-2 border-dashed border-primary bg-background/95 p-6">
+        <div className="text-center"><UploadCloud className="mx-auto mb-3 h-10 w-10 text-primary" /><div className="font-medium">Drop your reference image here</div><p className="mt-2 text-sm text-muted-foreground">JPEG, PNG or WebP · up to 15 MB</p></div>
+      </div> : null}
+      <div className="flex flex-wrap items-center justify-between gap-4 border-b border-border bg-card px-5 py-4">
+        <div className="min-w-0 flex-1 basis-48">
+          {mode === "picker" ? <h2 className="mb-2 text-lg font-semibold">Select Model Image</h2> : null}
+          <nav aria-label="Model library path" className="mt-1 flex min-w-0 items-center gap-1 text-sm text-muted-foreground">
+            {trail.map((crumb, index) => (
+              <span key={crumb.id} className="flex min-w-0 items-center gap-1">
+                {index > 0 ? <ChevronRight className="h-3 w-3 shrink-0" /> : null}
                 <button
-                  className="flex items-center hover:text-foreground"
-                  onClick={() => {
-                    const parent = path.substring(0, path.lastIndexOf("/"));
-                    setPath(parent || MODEL_ROOT_PATH);
-                  }}
+                  className={cn("truncate", index === trail.length - 1 ? "text-foreground" : "hover:text-foreground")}
+                  title={crumb.name}
+                  disabled={index === trail.length - 1 || Boolean(busy)}
+                  onClick={() => { setQuery(""); setTrail((current) => current.slice(0, index + 1)); }}
                 >
-                  <ChevronRight className="mr-1 h-3 w-3 rotate-180" /> Back
+                  {crumb.name}
                 </button>
-              ) : (
-                <span>Root</span>
-              )}
-              <span className="text-border">/</span>
-              <span className="truncate max-w-[300px]">{path.replace(MODEL_ROOT_PATH, "") || "Model"}</span>
+              </span>
+            ))}
+          </nav>
+          <p className="mt-2 text-xs text-muted-foreground">{loading ? "Loading…" : `${items.filter((item) => item.item_type === "FOLDER").length} folders · ${items.filter((item) => item.item_type !== "FOLDER").length} images`} · Drag an image here to upload</p>
+        </div>
+        <div className="flex max-w-full flex-wrap items-center gap-2">
+            <div className="relative w-[220px] max-w-full">
+              <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+              <Input aria-label="Search reference images" className="pl-8" placeholder="Search reference images" value={query} onChange={(e) => setQuery(e.target.value)} />
             </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (file) void upload(file);
+            }}
+          />
+          <Button disabled={Boolean(busy)} onClick={() => fileInputRef.current?.click()}>
+            {busy === "upload" ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <UploadCloud className="mr-1.5 h-4 w-4" />}
+            {busy === "upload" ? "Uploading…" : "Upload image"}
+          </Button>
+          <Button variant="outline" size="icon" title="Refresh" aria-label="Refresh library" disabled={loading || Boolean(busy)} onClick={() => void load(folderId)}>
+            <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+          </Button>
+          <div className="flex gap-0.5 border border-border p-0.5" role="group" aria-label="Library view">
+            <Button variant={viewMode === "grid" ? "secondary" : "ghost"} size="icon" title="Grid view" aria-label="Grid view" aria-pressed={viewMode === "grid"} onClick={() => setViewMode("grid")}><Grid2X2 className="h-4 w-4" /></Button>
+            <Button variant={viewMode === "list" ? "secondary" : "ghost"} size="icon" title="List view" aria-label="List view" aria-pressed={viewMode === "list"} onClick={() => setViewMode("list")}><List className="h-4 w-4" /></Button>
           </div>
-          <div className="flex items-center gap-2">
-            <Button variant="outline" size="icon" onClick={onRefresh}>
-              <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
-            </Button>
-            <Button variant="ghost" size="icon" onClick={onCancel}>
+          {onCancel ? (
+            <Button variant="ghost" size="icon" title="Close" onClick={onCancel}>
               <X className="h-5 w-5" />
             </Button>
-          </div>
+          ) : null}
         </div>
+      </div>
 
-        {/* Content */}
-        <div className="min-h-0 flex-1 overflow-y-auto bg-muted/20 p-4">
-          {loading ? (
-            <div className="flex h-full items-center justify-center">
-              <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-            </div>
-          ) : items.length === 0 ? (
-            <div className="flex h-full flex-col items-center justify-center text-muted-foreground">
-              <FolderGlyph className="mb-2 h-10" />
-              <p>Empty folder</p>
-            </div>
-          ) : (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-4">
-              {items.map((item) => {
-                const isSelected = selected?.id === item.id;
-                return (
-                  <button
-                    key={item.id}
-                    onClick={() => {
-                      if (item.type === "folder") {
-                        setPath(item.path);
-                        onSelect(null);
-                      } else {
-                        onSelect(item);
-                      }
-                    }}
-                    className={cn(
-                      "group relative flex aspect-square flex-col items-center justify-center overflow-hidden rounded-md border bg-card transition-all hover:border-primary/50 hover:shadow-md",
-                      isSelected ? "border-primary ring-2 ring-primary ring-offset-1" : "border-border",
-                    )}
-                  >
-                    {item.type === "folder" ? (
-                      <div className="flex h-full w-full flex-col items-center justify-center bg-secondary/50">
-                        <FolderGlyph className="mb-2 h-10" />
-                        <span className="truncate px-2 text-center text-xs font-medium w-full">{item.name}</span>
-                      </div>
-                    ) : item.thumbnailUrl ? (
-                      <>
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img
-                          src={item.thumbnailUrl}
-                          alt={item.name}
-                          loading="lazy"
-                          className="h-full w-full object-cover"
-                        />
-                        <div className="absolute inset-x-0 bottom-0 bg-black/60 px-2 py-1.5 text-center text-[10px] text-white opacity-0 transition-opacity group-hover:opacity-100">
-                          <span className="truncate block">{item.name}</span>
-                        </div>
-                      </>
+      <div className={cn("grid min-h-0 flex-1", selected && mode === "page" ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_280px]" : "grid-cols-1")}>
+      <div className="min-h-0 min-w-0 overflow-auto p-5">
+        {error ? (
+          <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>
+        ) : null}
+        {notice ? (
+          <div role="status" className="mb-4 break-all rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
+            {notice}
+          </div>
+        ) : null}
+        {loading ? (
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,180px),1fr))] gap-4" aria-label="Loading model library" aria-busy="true">
+            {Array.from({ length: 5 }, (_, index) => <div key={index} className="animate-pulse rounded-card border border-border bg-card p-2"><div className="aspect-[4/5] rounded-tile bg-muted" /><div className="mt-3 h-3 w-3/4 bg-muted" /></div>)}
+          </div>
+        ) : visibleItems.length === 0 ? (
+          <div className="mx-auto my-8 flex min-h-80 max-w-xl flex-col items-center justify-center rounded-card border border-dashed border-border bg-card p-8 text-center">
+            <div className="mb-5 rounded-full bg-secondary p-5">{query.trim() ? <Search className="h-8 w-8 text-muted-foreground" /> : <UploadCloud className="h-8 w-8 text-primary" />}</div>
+            <h3 className="text-base">{query.trim() ? "No matching images" : "Add your first reference image"}</h3>
+            <p className="mt-3 max-w-sm text-sm text-muted-foreground">{query.trim() ? "Try another name or clear your search to see all items." : "Drag an image here or upload a file to build your model reference library."}</p>
+            <Button className="mt-5" disabled={Boolean(busy)} onClick={() => query.trim() ? setQuery("") : fileInputRef.current?.click()}>{query.trim() ? "Clear search" : busy === "upload" ? "Uploading…" : "Upload image"}</Button>
+            {!query.trim() ? <p className="mt-3 text-xs text-muted-foreground">JPEG, PNG or WebP · up to 15 MB per image</p> : null}
+          </div>
+        ) : (
+          <div className={viewMode === "grid" ? "grid grid-cols-[repeat(auto-fill,minmax(min(100%,180px),240px))] gap-4" : "space-y-2"}>
+            {visibleItems.map((item) => {
+              const isFolder = item.item_type === "FOLDER";
+              const isSelected = selected?.id === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={cn(
+                    "min-w-0 overflow-hidden rounded-card border bg-card text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
+                    viewMode === "list" && "flex w-full items-center gap-4 p-2",
+                    isSelected ? "border-primary ring-2 ring-primary/30" : "border-border hover:border-primary/50",
+                  )}
+                  disabled={Boolean(busy)}
+                  onClick={() => (isFolder ? undefined : setSelected(item))}
+                  onDoubleClick={() => {
+                    if (isFolder) { setQuery(""); setTrail((current) => [...current, { id: item.id, name: item.name }]); }
+                    else if (mode === "picker") {
+                      setSelected(item);
+                      void pick(item);
+                    } else {
+                      window.open(item.web_view_link ?? `https://drive.google.com/file/d/${item.id}/view`, "_blank", "noopener,noreferrer");
+                    }
+                  }}
+                  title={isFolder ? "Double-click to open" : item.name}
+                >
+                  <div className={cn("flex items-center justify-center overflow-hidden bg-secondary", viewMode === "grid" ? "aspect-[4/5]" : "h-14 w-14 shrink-0 rounded-tile")}>
+                    {isFolder ? (
+                      <FolderGlyph className="h-12" />
                     ) : (
-                      <div className="flex h-full w-full flex-col items-center justify-center bg-secondary/50">
-                        <FileImage className="mb-2 h-8 w-8 text-muted-foreground" />
-                        <span className="truncate px-2 text-center text-xs font-medium w-full">{item.name}</span>
-                      </div>
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={`https://drive.google.com/thumbnail?id=${encodeURIComponent(item.id)}&sz=w400`}
+                        alt={item.name}
+                        loading="lazy"
+                        referrerPolicy="no-referrer"
+                        className="h-full w-full object-cover"
+                      />
                     )}
-                  </button>
-                );
-              })}
-            </div>
+                  </div>
+                  <div className="min-w-0 px-3 py-3"><div className="truncate text-sm font-medium">{item.name}</div><div className="mt-1 text-xs text-muted-foreground">{isFolder ? "Folder · double-click to open" : "Reference image"}</div></div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      {selected && mode === "page" ? <aside className="min-w-0 border-t border-border bg-card p-5 xl:border-l xl:border-t-0">
+        <div className="mb-4 flex items-center justify-between"><h3 className="text-xs">Image preview</h3><Button variant="ghost" size="icon" aria-label="Close image preview" onClick={() => setSelected(null)}><X className="h-4 w-4" /></Button></div>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={`https://drive.google.com/thumbnail?id=${encodeURIComponent(selected.id)}&sz=w800`} alt={selected.name} referrerPolicy="no-referrer" className="max-h-80 w-full rounded-tile bg-secondary object-contain" />
+        <div className="mt-4 text-sm font-medium [overflow-wrap:anywhere]">{selected.name}</div><p className="mt-2 text-xs text-muted-foreground">Use Copy link to use this image as a model reference.</p>
+      </aside> : null}
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border bg-card p-4">
+        <div className="min-w-0 truncate text-sm text-muted-foreground">
+          {selected ? (
+            <span className="font-medium text-foreground">Selected: {selected.name}</span>
+          ) : (
+            <span>{mode === "picker" ? "Choose a reference image, then select Use this image." : "Select an image to preview, open or copy its link."}</span>
           )}
         </div>
-
-        {/* Footer */}
-        <div className="flex items-center justify-between border-t border-border bg-card p-4">
-          <div className="text-sm text-muted-foreground">
-            {selected ? (
-              <span className="font-medium text-foreground">Selected: {selected.name}</span>
-            ) : (
-              "Select an image file"
-            )}
-          </div>
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={onCancel}>
-              Cancel
-            </Button>
-            <Button onClick={onConfirm} disabled={!selected || selected.type !== "file"}>
-              Confirm Selection
-            </Button>
-          </div>
+        <div className="flex shrink-0 gap-2">
+          {mode === "picker" ? (
+            <>
+              <Button variant="outline" onClick={onCancel}>
+                Cancel
+              </Button>
+              <Button onClick={() => void pick()} disabled={!selected || Boolean(busy)}>
+                {busy === "share" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Use this image
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button
+                variant="outline"
+                disabled={!selected}
+                onClick={() =>
+                  selected &&
+                  window.open(selected.web_view_link ?? `https://drive.google.com/file/d/${selected.id}/view`, "_blank", "noopener,noreferrer")
+                }
+              >
+                <Share2 className="mr-2 h-4 w-4" />
+                Open in Drive
+              </Button>
+              <Button onClick={() => selected && void copyLink(selected)} disabled={!selected || Boolean(busy)}>
+                {busy === "share" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Copy className="mr-2 h-4 w-4" />}
+                Copy link
+              </Button>
+            </>
+          )}
         </div>
       </div>
     </div>
   );
 }
+
+function DriveModelPickerDialog({
+  accessToken,
+  onPick,
+  onCancel,
+}: {
+  accessToken: string;
+  onPick: (url: string) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+      <div className="h-full max-h-[80vh] w-full max-w-4xl overflow-hidden rounded-xl border border-border bg-background shadow-2xl">
+        <ModelLibraryPanel accessToken={accessToken} mode="picker" onPick={onPick} onCancel={onCancel} />
+      </div>
+    </div>
+  );
+}
+
 
 
 function FolderTree({
@@ -2629,6 +1852,7 @@ function DriveContent({
   isRootFolder,
   onBack,
   onSync,
+  gridClassName,
 }: {
   items: DriveItem[];
   selectedItem: DriveItem | null;
@@ -2643,10 +1867,11 @@ function DriveContent({
   isRootFolder: boolean;
   onBack: () => void;
   onSync: () => void;
+  gridClassName?: string;
 }) {
   if (loading) {
     return (
-      <section className="grid grid-cols-[repeat(auto-fill,minmax(190px,1fr))] gap-4 p-5">
+      <section className={cn("grid grid-cols-[repeat(auto-fill,minmax(190px,1fr))] gap-4 p-5", gridClassName)}>
         {Array.from({ length: 8 }).map((_, index) => (
           <div key={index} className="h-[250px] animate-pulse rounded-md border border-border bg-card">
             <div className="h-36 bg-muted" />
@@ -2719,7 +1944,7 @@ function DriveContent({
   return (
     <section className="min-w-0 p-5">
       {viewMode === "grid" ? (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,190px),240px))] gap-4">
+        <div className={cn("grid grid-cols-[repeat(auto-fill,minmax(min(100%,190px),240px))] gap-4", gridClassName)}>
           {items.map((item) => (
             <MediaCard
               key={item.id}
@@ -2797,7 +2022,7 @@ function MediaCard({
   return (
     <article
       className={cn(
-        "group relative flex flex-col rounded-card bg-card p-2 transition focus-within:shadow-[0_6px_24px_rgba(28,28,28,0.08)] hover:bg-card hover:shadow-[0_6px_24px_rgba(28,28,28,0.08)]",
+        "group relative flex min-w-0 flex-col rounded-card bg-card p-2 transition focus-within:shadow-[0_6px_24px_rgba(28,28,28,0.08)] hover:bg-card hover:shadow-[0_6px_24px_rgba(28,28,28,0.08)]",
         selected ? "ring-1 ring-primary" : previewed && "ring-1 ring-brand-line shadow-[0_6px_24px_rgba(28,28,28,0.08)]",
       )}
     >
@@ -2808,7 +2033,7 @@ function MediaCard({
       >
         {/* Drive's folder thumbnails are blurry generic icons — always use our glyph. */}
         {isFolder ? (
-          <FolderGlyph className="h-16 transition-transform duration-300 group-hover:scale-110" />
+          <FolderGlyph className="folder-card-icon h-16 shrink-0 transition-transform duration-300 motion-safe:group-hover:scale-110" />
         ) : item.thumbnailUrl ? (
           <Image src={item.thumbnailUrl} alt="" fill sizes="260px" className="object-cover" unoptimized={isGoogleThumbnail(item.thumbnailUrl)} referrerPolicy="no-referrer" />
         ) : (
@@ -3272,28 +2497,12 @@ function Info({ label, value }: { label: string; value: string }) {
 const JOBS_POLL_INTERVAL_MS = 15_000;
 const JOB_GRID = "grid grid-cols-[minmax(0,1.8fr)_90px_140px_110px_130px_120px_88px] gap-3";
 
-const RAW_STATUS_LABEL: Record<string, string> = {
-  queued_scan: "Queued scan",
-  scanning: "Scanning",
-  ready: "Ready",
-  processing: "Processing",
-  completed: "Completed",
-  skipped: "Skipped",
-  failed: "Failed",
-  partial_failed: "Partially failed",
-  canceled: "Canceled",
-};
-
 const RETRY_ACTION_LABEL: Record<string, string> = {
   recovery_existing_assets: "Can recover from saved outputs",
   resume_anchor_checkpoint: "Can resume from checkpoint",
-  restart_generation_requires_approval: "Restart needs approval",
+  restart_generation_requires_approval: "Generating again requires confirmation",
   manual_review: "Needs manual review",
 };
-
-function statusLabel(status: WorkflowStatus, rawStatus?: string) {
-  return (rawStatus && RAW_STATUS_LABEL[rawStatus]) ?? status;
-}
 
 /** Depth-first order of the scan tree so children render under their parent. */
 function orderFolderTree(folders: JobFolderRun[]): JobFolderRun[] {
@@ -3486,8 +2695,8 @@ function JobsPage({
                     </div>
                   </div>
                   <span className="truncate text-sm capitalize">{job.productType ?? "—"}</span>
-                  <Badge variant={statusVariant[job.status]}>{statusLabel(job.status, job.rawStatus)}</Badge>
-                  <Progress value={job.progress} />
+                  <WorkflowStatusBadge status={job.status} rawStatus={job.rawStatus} />
+                  <WorkflowProgress value={job.progress} status={job.status} rawStatus={job.rawStatus} />
                   <span className="text-sm text-muted-foreground">
                     {counts.done}/{counts.total}
                     {counts.failed ? <span className="ml-1 text-red-600">· {counts.failed} failed</span> : null}
@@ -3514,14 +2723,14 @@ function JobsPage({
                           <div className="min-w-0">
                             <div className="truncate text-sm" title={folder.sourcePath ?? folder.name}>{folder.name}</div>
                             {folder.errorMessage ? (
-                              <div className="truncate text-[11px] text-red-700" title={folder.errorMessage}>
-                                {folder.errorMessage}
+                              <div className="text-[11px] text-red-700 [overflow-wrap:anywhere]">
+                                {workflowErrorMessage(folder.errorMessage)}
                               </div>
                             ) : null}
                           </div>
                         </div>
                         <span />
-                        <Badge variant={statusVariant[folder.status]}>{statusLabel(folder.status, folder.rawStatus)}</Badge>
+                        <WorkflowStatusBadge status={folder.status} rawStatus={folder.rawStatus} />
                         <span />
                         <span className="text-xs text-muted-foreground">
                           {folder.imageCount !== null ? `${folder.imageCount} images` : "Not scanned"}
@@ -3579,24 +2788,33 @@ function JobDetail({
     <aside className="overflow-auto border-l border-border bg-card p-5">
       <div className="mb-4 flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <Badge variant={statusVariant[job.status]}>{statusLabel(job.status, job.rawStatus)}</Badge>
+          <WorkflowStatusBadge status={job.status} rawStatus={job.rawStatus} />
           <h3 className="mt-3 truncate text-lg font-semibold" title={label}>{label}</h3>
-          <p className="font-mono text-xs text-muted-foreground">{job.id}</p>
+          {job.productType ? <p className="mt-1 text-xs capitalize text-muted-foreground">{job.productType}</p> : null}
         </div>
         {job.canRetry ? (
           <RetryButton runId={job.id} label={label} retryingRunId={retryingRunId} onRetry={onRetry} />
         ) : null}
       </div>
-      <Progress value={job.progress} className="mb-2" />
+      <WorkflowProgress value={job.progress} status={job.status} rawStatus={job.rawStatus} className="mb-2" />
       <div className="mb-5 text-xs text-muted-foreground">
         {counts.done} of {counts.total} folders completed
         {counts.failed ? ` · ${counts.failed} failed` : ""} · started {formatDate(job.startedAt ?? job.createdAt)}
       </div>
 
-      {job.errorMessage ? (
+      {job.errorMessage || counts.failed ? (
         <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-          <CircleAlert className="mb-1 h-4 w-4" />
-          {job.errorMessage}
+          <div className="flex items-start gap-2"><CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+            <div className="min-w-0">
+              <div className="font-semibold">{counts.failed ? `${counts.failed} ${counts.failed === 1 ? "folder needs" : "folders need"} attention` : "Workflow could not finish"}</div>
+              {counts.failed ? <ul className="mt-2 space-y-2">
+                {folders.filter((folder) => folder.status === "FAILED").map((folder) => <li key={folder.runId} className="[overflow-wrap:anywhere]">
+                  <div className="font-medium">{folder.name}</div>
+                  <div className="mt-0.5 text-xs">{workflowErrorMessage(folder.errorMessage ?? job.errorMessage)}</div>
+                </li>)}
+              </ul> : <p className="mt-1 [overflow-wrap:anywhere]">{workflowErrorMessage(job.errorMessage)}</p>}
+            </div>
+          </div>
         </div>
       ) : null}
 
@@ -3616,12 +2834,12 @@ function JobDetail({
               )}
               style={{ paddingLeft: 8 + folder.depth * 16 }}
             >
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <FolderGlyph className="h-4 shrink-0" />
-                <span className="min-w-0 flex-1 truncate text-sm" title={folder.sourcePath ?? folder.name}>
+                <span className="min-w-0 flex-1 basis-24 text-sm font-medium [overflow-wrap:anywhere]" title={folder.sourcePath ?? folder.name}>
                   {folder.name}
                 </span>
-                <Badge variant={statusVariant[folder.status]}>{statusLabel(folder.status, folder.rawStatus)}</Badge>
+                <WorkflowStatusBadge status={folder.status} rawStatus={folder.rawStatus} />
                 {folder.canRetry ? (
                   <RetryButton
                     runId={folder.runId}
@@ -3641,7 +2859,7 @@ function JobDetail({
                   : ""}
               </div>
               {folder.errorMessage ? (
-                <div className="mt-1 break-words pl-6 text-xs text-red-700">{folder.errorMessage}</div>
+                <div className="mt-2 pl-6 text-xs leading-relaxed text-red-700 [overflow-wrap:anywhere]">{workflowErrorMessage(folder.errorMessage)}</div>
               ) : null}
               {folder.files.length ? (
                 <ul className="mt-1.5 space-y-0.5 pl-6">
@@ -3664,7 +2882,7 @@ function JobDetail({
   );
 }
 
-// ─── Final Output tab: browse the generated-output Drive tree ─────────────────
+// ─── Final Output tab: browse the generated-output Drive tree (final_items) ────
 
 function driveDownloadUrl(item: DriveItem) {
   return `https://drive.google.com/uc?export=download&id=${encodeURIComponent(item.driveItemId)}`;
@@ -3690,21 +2908,11 @@ function FinalBrowser({ accessToken }: { accessToken: string }) {
   const [meta, setMeta] = useState<Record<string, FinalFolderMeta>>({
     [FINAL_ROOT_FOLDER_ID]: { name: FINAL_ROOT_FOLDER_NAME, parentId: null },
   });
-  const [folderChildren, setFolderChildren] = useState<Record<string, DriveItem[]>>({});
-  const [expanded, setExpanded] = useState<Set<string>>(new Set([FINAL_ROOT_FOLDER_ID]));
-  const [loadingKeys, setLoadingKeys] = useState<Set<string>>(new Set());
   const syncedRef = useRef(new Set<string>());
   const requestRef = useRef(0);
 
   const listFolder = useCallback(async (folderId: string) => {
-    const params = new URLSearchParams({
-      connection_id: DEFAULT_CONNECTION_ID,
-      folder_id: folderId,
-      page: "1",
-      page_size: "500",
-      sort: "modified_desc",
-    });
-    const response = await platformApi.listFolder(accessToken, params);
+    const response = await platformApi.listFinalFolder(accessToken, folderId);
     if (!response.success || !response.data) {
       return { ok: false as const, error: response.error?.message ?? "Could not load folder.", items: [] as DriveItem[] };
     }
@@ -3717,13 +2925,7 @@ function FinalBrowser({ accessToken }: { accessToken: string }) {
     let result = await listFolder(folderId);
     if (!result.ok || (result.items.length > 0 && !force) || (!force && syncedRef.current.has(folderId))) return result;
     syncedRef.current.add(folderId);
-    const sync = await platformApi.syncDrive(accessToken, {
-      connection_id: DEFAULT_CONNECTION_ID,
-      root_folder_id: folderId,
-      sync_mode: "INCREMENTAL",
-      recursive: false,
-      max_folders: 1,
-    });
+    const sync = await platformApi.syncFinalFolder(accessToken, folderId);
     if (!sync.success) return { ...result, error: sync.error?.message ?? "Could not sync folder." };
     for (const delayMs of [0, 2000, 4000]) {
       if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -3735,7 +2937,6 @@ function FinalBrowser({ accessToken }: { accessToken: string }) {
 
   const rememberFolders = useCallback((parentId: string, list: DriveItem[]) => {
     const folders = list.filter((item) => item.itemType === "FOLDER" && item.driveItemId !== parentId);
-    setFolderChildren((current) => ({ ...current, [parentId]: folders }));
     setMeta((current) => {
       const next = { ...current };
       for (const folder of folders) next[folder.driveItemId] = { name: folder.name, parentId };
@@ -3756,31 +2957,11 @@ function FinalBrowser({ accessToken }: { accessToken: string }) {
     setItems(result.items);
     if (result.error) setError(result.error);
     rememberFolders(folderId, result.items);
-    setExpanded((current) => new Set(current).add(folderId));
   }, [fetchFolder, rememberFolders]);
 
   useEffect(() => {
     queueMicrotask(() => void openFolderId(FINAL_ROOT_FOLDER_ID));
   }, [openFolderId]);
-
-  async function toggleTreeFolder(folderId: string) {
-    const isOpen = expanded.has(folderId);
-    setExpanded((current) => {
-      const next = new Set(current);
-      if (isOpen) next.delete(folderId);
-      else next.add(folderId);
-      return next;
-    });
-    if (isOpen || folderChildren[folderId]) return;
-    setLoadingKeys((current) => new Set(current).add(folderId));
-    const result = await fetchFolder(folderId);
-    setLoadingKeys((current) => {
-      const next = new Set(current);
-      next.delete(folderId);
-      return next;
-    });
-    if (result.ok) rememberFolders(folderId, result.items);
-  }
 
   const breadcrumbs: FolderCrumb[] = useMemo(() => {
     const chain: FolderCrumb[] = [];
@@ -3816,7 +2997,7 @@ function FinalBrowser({ accessToken }: { accessToken: string }) {
   }
 
   return (
-    <div className={cn("grid min-h-0 flex-1", panelOpen ? "grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-[minmax(0,1fr)]")}>
+    <div className={cn("grid min-h-0 min-w-0 flex-1", panelOpen ? "grid-cols-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-[minmax(0,1fr)]")}>
       <div className={cn("min-w-0", panelOpen && "border-r border-border")}>
         <DriveToolbar
           query={query}
@@ -3835,21 +3016,18 @@ function FinalBrowser({ accessToken }: { accessToken: string }) {
           previewPanelOpen={panelOpen}
           onTogglePreviewPanel={() => setPanelOpen((open) => !open)}
         />
-        <div className="grid min-h-[calc(100vh-72px)] grid-cols-[260px_minmax(0,1fr)]">
-          <FolderTree
-            rootChildren={folderChildren[FINAL_ROOT_FOLDER_ID] ?? []}
-            folderChildren={folderChildren}
-            expanded={expanded}
-            currentKey={currentId === FINAL_ROOT_FOLDER_ID ? "root" : currentId}
-            loadingKeys={loadingKeys}
-            onNavigate={(key) => void openFolderId(key === "root" ? FINAL_ROOT_FOLDER_ID : key)}
-            onToggle={(key) => void toggleTreeFolder(key === "root" ? FINAL_ROOT_FOLDER_ID : key)}
-          />
+        <div className="min-h-[calc(100vh-72px)] min-w-0">
           <DriveContent
             items={visibleItems}
-            selectedItem={null}
+            gridClassName="final-output-grid"
+            selectedItem={previewItem}
             previewItem={previewItem}
-            onSelect={() => undefined}
+            onSelect={(id) => {
+              const item = visibleItems.find((candidate) => candidate.id === id);
+              if (!item) return;
+              setPreviewItem(item);
+              setPanelOpen(true);
+            }}
             onPreview={(item) => {
               setPreviewItem(item);
               setPanelOpen(true);
