@@ -2,6 +2,7 @@
 
 import {
   Activity,
+  ArrowLeft,
   BellRing,
   Check,
   ChevronRight,
@@ -25,6 +26,8 @@ import {
   Loader2,
   LogOut,
   MoreHorizontal,
+  PanelRightClose,
+  PanelRightOpen,
   Pencil,
   Play,
   RefreshCw,
@@ -137,13 +140,34 @@ function isValidStoragePrefix(value: string): boolean {
   return !invalidPatterns.some(pattern => value.includes(pattern));
 }
 
+const PREVIEW_PANEL_STORAGE_KEY = "drive.previewPanel";
+
 type OutputType = "image" | "video" | "both";
 
-const OUTPUT_TYPE_OPTIONS: { value: OutputType; label: string }[] = [
-  { value: "image", label: "Image" },
-  { value: "video", label: "Video" },
-  { value: "both", label: "Both" },
+// The n8n contract (BR-19) still always produces images + a video, so only
+// "both" is selectable until the workflow honours output_type.
+const OUTPUT_TYPE_OPTIONS: { value: OutputType; label: string; available: boolean }[] = [
+  { value: "image", label: "Image", available: false },
+  { value: "video", label: "Video", available: false },
+  { value: "both", label: "Both", available: true },
 ];
+
+/** Reference images must be direct public HTTPS image URLs the provider can fetch. */
+function validateReferenceImageUrl(label: string, value: string | null): string | null {
+  if (!value) return null;
+  if (value.length > 2048) return `${label} must be at most 2048 characters.`;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return `${label} must be a valid URL.`;
+  }
+  if (url.protocol !== "https:") return `${label} must be a public HTTPS link.`;
+  if (/(^|\.)(drive|docs)\.google\.com$/.test(url.hostname)) {
+    return `${label} must link directly to an image, not a Google Drive preview.`;
+  }
+  return null;
+}
 
 type ProductTypeOption = { value: string; label: string; category?: string };
 
@@ -195,6 +219,8 @@ export default function Home() {
   const [currentFolder, setCurrentFolder] = useState<DriveItem | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<FolderCrumb[]>([{ driveItemId: null, name: "Root folder" }]);
   const [currentFolderKey, setCurrentFolderKey] = useState("root");
+  const currentFolderKeyRef = useRef("root");
+  const driveRequestIdRef = useRef(0);
   const [folderChildren, setFolderChildren] = useState<Record<string, DriveItem[]>>({});
   const [folderParent, setFolderParent] = useState<Record<string, string>>({});
   const [folderMeta, setFolderMeta] = useState<Record<string, FolderMeta>>({
@@ -242,12 +268,16 @@ export default function Home() {
   const [submitting, setSubmitting] = useState(false);
 
   // Generation form state
+  const syncedFolderIdsRef = useRef(new Set<string>());
+  const [previewPanelOpen, setPreviewPanelOpen] = useState(true);
   const [productType, setProductType] = useState("cape");
   const [productTypeOptions, setProductTypeOptions] = useState<ProductTypeOption[]>(DEFAULT_PRODUCT_TYPE_OPTIONS);
   const [productDescription, setProductDescription] = useState("");
   const [sample_prompt, setSamplePrompt] = useState("");
   const [sourceStoragePrefix, setSourceStoragePrefix] = useState("google-drive/01_New_Product_Raw/ARTIC WIDE LAPEL");
   const [modelReferenceUrl, setModelReferenceUrl] = useState("");
+  const [styleReferenceUrl, setStyleReferenceUrl] = useState("");
+  const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [outputType, setOutputType] = useState<OutputType>("both");
   const [imageCount, setImageCount] = useState("4");
   const [videoSeconds, setVideoSeconds] = useState("8");
@@ -296,7 +326,7 @@ export default function Home() {
     return modelItems.filter((item) => item.name.toLowerCase().includes(normalized));
   }, [modelItems, modelQuery]);
 
-  const fetchDriveFolder = useCallback(async (
+  const listDriveFolder = useCallback(async (
     token: string,
     folderDriveId: string | null,
     storagePath: string | null,
@@ -340,6 +370,43 @@ export default function Home() {
       folder: folder && !isHiddenDrivePlaceholder(folder) ? normalizeDriveItem(folder) : null,
     };
   }, []);
+
+  const fetchDriveFolder = useCallback(async (
+    token: string,
+    folderDriveId: string | null,
+    storagePath: string | null,
+  ) => {
+    const result = await listDriveFolder(token, folderDriveId, storagePath);
+    if (
+      !folderDriveId ||
+      storagePath ||
+      !result.response?.success ||
+      result.items.length > 0 ||
+      syncedFolderIdsRef.current.has(folderDriveId)
+    ) {
+      return result;
+    }
+
+    // Drive metadata is synced one folder level at a time; pull this folder's
+    // children on first open instead of waiting for the cron to reach it.
+    syncedFolderIdsRef.current.add(folderDriveId);
+    const sync = await platformApi.syncDrive(token, {
+      connection_id: DEFAULT_CONNECTION_ID,
+      root_folder_id: folderDriveId,
+      sync_mode: "INCREMENTAL",
+      recursive: false,
+      max_folders: 1,
+    });
+    if (!sync.success) return result;
+
+    // n8n may acknowledge the webhook before its callback has stored the items.
+    for (const delayMs of [0, 2000, 4000]) {
+      if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      const refreshed = await listDriveFolder(token, folderDriveId, storagePath);
+      if (!refreshed.response?.success || refreshed.items.length > 0) return refreshed;
+    }
+    return result;
+  }, [listDriveFolder]);
 
   const storeFolderChildren = useCallback((key: string, children: DriveItem[], parentName?: string) => {
     // Synced items can reference the parent folder itself; drop them to avoid tree cycles.
@@ -423,29 +490,35 @@ export default function Home() {
     folderDriveId: string | null = null,
     storagePath: string | null = null,
   ) => {
+    const requestId = ++driveRequestIdRef.current;
     setLoadingDrive(true);
     setAppError(null);
     const key = getFolderKey(folderDriveId, storagePath);
     const { response, items: normalizedItems, folder: normalizedFolder } = await fetchDriveFolder(token, folderDriveId, storagePath);
 
+    // A slower request must not send the user back to a previous folder.
+    if (requestId !== driveRequestIdRef.current) return;
     setLoadingDrive(false);
 
     if (!response?.success || !response.data) {
-      setItems([]);
-      setPreviewItem(null);
-      setSelectedItem(null);
       setAppError(response.error?.message ?? "Could not load Google Drive metadata from Supabase.");
       return;
     }
 
+    const sameFolder = currentFolderKeyRef.current === key;
+    currentFolderKeyRef.current = key;
     storeFolderChildren(key, normalizedItems, normalizedFolder?.name);
     setItems(normalizedItems);
     setCurrentFolder(normalizedFolder);
     setCurrentFolderKey(key);
     setBreadcrumbs(buildCrumbs(key));
     expandAncestors(key);
-    setPreviewItem(normalizedItems[0] ?? null);
-    setSelectedItem(null);
+    setPreviewItem((current) => sameFolder && current
+      ? normalizedItems.find((candidate) => candidate.id === current.id) ?? null
+      : normalizedItems[0] ?? null);
+    setSelectedItem((current) => sameFolder && current
+      ? normalizedItems.find((candidate) => candidate.id === current.id) ?? null
+      : null);
   }, [buildCrumbs, expandAncestors, fetchDriveFolder, storeFolderChildren]);
 
   // ── Model tab: load from Supabase Storage directly — no Drive API ──────────
@@ -560,6 +633,22 @@ export default function Home() {
     setFinalFiles(response.data.files);
   }, [customFromDate, customToDate, dateFilter]);
 
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(PREVIEW_PANEL_STORAGE_KEY) === "closed") setPreviewPanelOpen(false);
+    } catch {
+      // Storage unavailable (private mode etc.); keep the default.
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PREVIEW_PANEL_STORAGE_KEY, previewPanelOpen ? "open" : "closed");
+    } catch {
+      // Ignore storage failures; the panel state is a convenience only.
+    }
+  }, [previewPanelOpen]);
+
   // ── Trigger Model Storage load when modelPath or activeTab changes ─────────
   useEffect(() => {
     if (activeTab === "model") {
@@ -598,29 +687,35 @@ export default function Home() {
     const supabase = createBrowserSupabaseClient();
     if (!supabase) return;
 
-    supabase.auth.getSession().then(({ data }) => {
-      const token = data.session?.access_token ?? null;
-      setAccessToken(token);
-      setUserEmail(data.session?.user.email ?? null);
-      setIsSignedIn(Boolean(token));
-      if (token) {
-        void loadDrive(token);
-        void loadJobs(token);
-      }
-    });
-
+    let workspaceUserId: string | null = null;
+    let initialLoadTimer: ReturnType<typeof setTimeout> | undefined;
+    // INITIAL_SESSION provides the existing session too. Avoid a second,
+    // competing getSession load and leave the workspace alone on token refresh.
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
       const token = session?.access_token ?? null;
+      const userId = session?.user.id ?? null;
       setAccessToken(token);
       setUserEmail(session?.user.email ?? null);
       setIsSignedIn(Boolean(token));
-      if (token) {
+      if (workspaceUserId === userId) return;
+      workspaceUserId = userId;
+      clearTimeout(initialLoadTimer);
+      ++driveRequestIdRef.current;
+      currentFolderKeyRef.current = "root";
+      if (!token) return;
+
+      // Start requests after the auth callback releases the session lock.
+      initialLoadTimer = setTimeout(() => {
         void loadDrive(token);
         void loadJobs(token);
-      }
+      }, 0);
     });
 
-    return () => listener.subscription.unsubscribe();
+    return () => {
+      clearTimeout(initialLoadTimer);
+      ++driveRequestIdRef.current;
+      listener.subscription.unsubscribe();
+    };
   }, [loadDrive, loadJobs]);
 
   useEffect(() => {
@@ -657,6 +752,7 @@ export default function Home() {
   function selectAndPreview(item: DriveItem) {
     applySelection(item);
     setPreviewItem(item);
+    setPreviewPanelOpen(true);
   }
 
   function getDescendantFiles(folderId: string): DriveItem[] {
@@ -788,9 +884,7 @@ export default function Home() {
       setModelPreviewItem(null);
       setModelQuery("");
     }
-    if (tab === "browser") {
-      if (accessToken) void loadDrive(accessToken);
-    }
+    // Returning to Drive Browser preserves its folder, selection and form.
   }
 
   function openModelItem(item: StorageItem) {
@@ -993,6 +1087,13 @@ export default function Home() {
 
   async function submitWorkflow() {
     if (!accessToken || !selectedItem) return;
+    setSubmitNotice(null);
+
+    // n8n needs a real Google Drive folder/file ID; Storage fallback items only carry a path.
+    if (selectedItem.connectionId === "storage") {
+      setAppError("Select a synced Google Drive folder or file. Storage paths cannot be sent to the workflow.");
+      return;
+    }
 
     let selectedItems: DriveItem[] = [];
     if (selectedItem.itemType === "FOLDER") {
@@ -1021,7 +1122,15 @@ export default function Home() {
     setAppError(null);
 
     // Sanitize URLs to remove Markdown links
-    const sanitizedModelReferenceUrl = stripMarkdownLink(modelReferenceUrl);
+    const sanitizedModelReferenceUrl = stripMarkdownLink(modelReferenceUrl.trim());
+    const sanitizedStyleReferenceUrl = stripMarkdownLink(styleReferenceUrl.trim());
+    const referenceError =
+      validateReferenceImageUrl("Model Reference URL", sanitizedModelReferenceUrl) ??
+      validateReferenceImageUrl("Style Reference URL", sanitizedStyleReferenceUrl);
+    if (referenceError) {
+      setAppError(referenceError);
+      return;
+    }
 
     // Debug logging (sanitized, no sensitive data)
     console.log("Submitting workflow:", {
@@ -1069,6 +1178,7 @@ export default function Home() {
         sample_prompt: sample_prompt,
         source_storage_prefix: sourceStoragePrefix,
         model_reference_url: sanitizedModelReferenceUrl ?? "",
+        style_reference_url: sanitizedStyleReferenceUrl ?? "",
         output_type: outputType,
         image_count: parseInt(imageCount, 10),
         video_seconds: parseInt(videoSeconds, 10),
@@ -1083,15 +1193,14 @@ export default function Home() {
       return;
     }
 
-    // Show success message with job ID
-    if (response.data?.job_id) {
-      setAppError(null);
-      // Optionally show a success toast or message
-      console.log("Workflow submitted successfully:", response.data.job_id);
-    }
-
-    await loadJobs(accessToken);
-    setActiveTab("jobs");
+    // n8n only acknowledges receipt ("Workflow got started."); it does not
+    // return a job ID or wait for validation, so this is "sent", not "done".
+    // Do not auto-retry: there is no idempotency key yet.
+    setAppError(null);
+    setSubmitNotice(
+      "Đã gửi tới n8n. Workflow chạy nền — kết quả sẽ xuất hiện ở tab thành phẩm khi hoàn tất. Không bấm gửi lại nếu chưa chắc lượt trước bị lỗi.",
+    );
+    void loadJobs(accessToken);
   }
 
   if (!isSignedIn) {
@@ -1116,9 +1225,16 @@ export default function Home() {
 
           {/* ── Drive Browser tab ─────────────────────────────────────── */}
           {activeTab === "browser" ? (
-            <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_360px]">
-              <div className="min-w-0 border-r border-border">
+            <div
+              className={cn(
+                "grid min-h-0 min-w-0 flex-1",
+                previewPanelOpen ? "grid-cols-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-[minmax(0,1fr)]",
+              )}
+            >
+              <div className={cn("min-w-0", previewPanelOpen && "border-r border-border")}>
                 <DriveToolbar
+                  previewPanelOpen={previewPanelOpen}
+                  onTogglePreviewPanel={() => setPreviewPanelOpen((open) => !open)}
                   query={query}
                   setQuery={setQuery}
                   viewMode={viewMode}
@@ -1165,10 +1281,16 @@ export default function Home() {
                     viewMode={viewMode}
                     loading={loadingDrive}
                     error={appError}
+                    query={query}
+                    isRootFolder={breadcrumbs.length <= 1}
+                    onBack={() => selectBreadcrumb(breadcrumbs.length - 2)}
+                    onSync={syncDrive}
                   />
                 </div>
               </div>
+              {previewPanelOpen ? (
               <PreviewDrawer
+                onClose={() => setPreviewPanelOpen(false)}
                 item={previewItem}
                 selectedItem={selectedItem}
                 productType={productType}
@@ -1182,6 +1304,9 @@ export default function Home() {
                 setSourceStoragePrefix={setSourceStoragePrefix}
                 modelReferenceUrl={modelReferenceUrl}
                 setModelReferenceUrl={setModelReferenceUrl}
+                styleReferenceUrl={styleReferenceUrl}
+                setStyleReferenceUrl={setStyleReferenceUrl}
+                submitNotice={submitNotice}
                 onOpenModelPicker={openModelPicker}
                 outputType={outputType}
                 setOutputType={setOutputType}
@@ -1197,6 +1322,7 @@ export default function Home() {
                 onSubmit={submitWorkflow}
                 onOpenFolder={openFolder}
               />
+              ) : null}
             </div>
           ) : null}
 
@@ -1426,14 +1552,14 @@ function TopBar({
   onRunWorkflow: () => void;
 }) {
   return (
-    <header className="flex h-16 items-center justify-between border-b border-border bg-card px-5">
-      <div>
+    <header className="flex min-h-16 min-w-0 flex-wrap items-center justify-between gap-3 border-b border-border bg-card px-5 py-3">
+      <div className="min-w-0 flex-1 basis-60">
         <h2 className="text-base font-semibold">Creative source media</h2>
-        <p className="text-xs text-muted-foreground">
+        <p className="truncate text-xs text-muted-foreground" title={selectedItem?.name}>
           {selectedItem ? `${selectedItem.itemType === 'FOLDER' ? 'Folder' : 'File'} selected: ${selectedItem.name}` : 'Select a file or folder to generate media'}
         </p>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex shrink-0 items-center gap-2">
         <Button variant="outline" size="sm">
           <BellRing className="h-4 w-4" />
           Events
@@ -1458,6 +1584,8 @@ function DriveToolbar({
   summary,
   onBreadcrumbSelect,
   onRefresh,
+  previewPanelOpen,
+  onTogglePreviewPanel,
 }: {
   query: string;
   setQuery: (value: string) => void;
@@ -1469,15 +1597,30 @@ function DriveToolbar({
   summary: string;
   onBreadcrumbSelect: (index: number) => void;
   onRefresh: () => void;
+  previewPanelOpen: boolean;
+  onTogglePreviewPanel: () => void;
 }) {
   // Long paths collapse to: Root › … › parent › current
-  const visibleCrumbs = breadcrumbs.length > 4
+  const visibleCrumbs = breadcrumbs.length > 3
     ? [0, -1, breadcrumbs.length - 2, breadcrumbs.length - 1]
     : breadcrumbs.map((_, index) => index);
+  const canGoBack = breadcrumbs.length > 1;
+  const parentCrumb = canGoBack ? breadcrumbs[breadcrumbs.length - 2] : null;
 
   return (
-    <div className="flex h-[72px] items-center justify-between border-b border-border px-5">
-      <div className="min-w-0 flex-1 pr-4">
+    <div className="flex min-h-[72px] min-w-0 flex-wrap items-center gap-y-3 border-b border-border px-5 py-3">
+      <Button
+        variant="outline"
+        size="icon"
+        className="mr-3 shrink-0"
+        disabled={!canGoBack}
+        onClick={() => onBreadcrumbSelect(breadcrumbs.length - 2)}
+        title={parentCrumb ? `Back to ${parentCrumb.name}` : "Already at root folder"}
+        aria-label="Back to parent folder"
+      >
+        <ArrowLeft className="h-4 w-4" />
+      </Button>
+      <div className="min-w-0 flex-1 basis-40 pr-4">
         <nav aria-label="Folder path" className="flex min-w-0 items-center gap-0.5 text-sm text-muted-foreground">
           {visibleCrumbs.map((index, position) => {
             if (index === -1) {
@@ -1491,7 +1634,10 @@ function DriveToolbar({
             const crumb = breadcrumbs[index];
             const isCurrent = index === breadcrumbs.length - 1;
             return (
-              <span key={`${crumb.driveItemId ?? "root"}-${index}`} className="flex min-w-0 items-center gap-0.5">
+              <span
+                key={`${crumb.driveItemId ?? "root"}-${index}`}
+                className={cn("flex min-w-0 items-center gap-0.5", isCurrent ? "shrink-0 basis-auto" : "shrink")}
+              >
                 {position > 0 ? <ChevronRight className="h-3.5 w-3.5 shrink-0 text-brand-line" /> : null}
                 <button
                   className={cn(
@@ -1506,7 +1652,11 @@ function DriveToolbar({
                   title={crumb.name}
                 >
                   {index === 0 ? <HomeIcon className="h-3.5 w-3.5 shrink-0" /> : null}
-                  <span className="max-w-[180px] truncate">{crumb.name}</span>
+                  {index === 0 && !isCurrent ? (
+                    <span className="sr-only">{crumb.name}</span>
+                  ) : (
+                    <span className={cn("truncate", isCurrent ? "max-w-[260px]" : "max-w-[140px]")}>{crumb.name}</span>
+                  )}
                 </button>
               </span>
             );
@@ -1514,8 +1664,8 @@ function DriveToolbar({
         </nav>
         <div className="mt-0.5 pl-1.5 text-xs text-muted-foreground">{summary}</div>
       </div>
-      <div className="flex items-center gap-2">
-        <div className="relative w-[280px]">
+      <div className="flex max-w-full flex-wrap items-center gap-2">
+        <div className="relative w-[280px] max-w-full flex-1 basis-40">
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
           <Input
             className="pl-8"
@@ -1548,6 +1698,16 @@ function DriveToolbar({
             <List className="h-4 w-4" />
           </Button>
         </div>
+        <Button
+          variant={previewPanelOpen ? "secondary" : "outline"}
+          size="icon"
+          onClick={onTogglePreviewPanel}
+          title={previewPanelOpen ? "Hide details panel" : "Show details panel"}
+          aria-label={previewPanelOpen ? "Hide details panel" : "Show details panel"}
+          aria-pressed={previewPanelOpen}
+        >
+          {previewPanelOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
+        </Button>
       </div>
     </div>
   );
@@ -2063,7 +2223,7 @@ function ModelPreviewPanel({
   const previewUrl = isImage ? item.thumbnailUrl : publicUrl;
 
   return (
-    <aside className="overflow-auto bg-card p-5">
+    <aside className="min-w-0 overflow-auto bg-card p-5">
       <div className="mb-4 flex items-center justify-between">
         <h3 className="text-sm font-semibold">File Preview</h3>
       </div>
@@ -2436,11 +2596,6 @@ function FolderTree({
           </button>
         </div>
         {isExpanded && children?.length ? children.map((child) => renderNode(child, depth + 1, lineage)) : null}
-        {isExpanded && hasKnownNoChildren ? (
-          <div className="h-8 py-1 text-xs italic text-muted-foreground" style={{ paddingLeft: 8 + (depth + 1) * 16 }}>
-            No subfolders
-          </div>
-        ) : null}
       </div>
     );
   }
@@ -2496,6 +2651,10 @@ function DriveContent({
   viewMode,
   loading,
   error,
+  query,
+  isRootFolder,
+  onBack,
+  onSync,
 }: {
   items: DriveItem[];
   selectedItem: DriveItem | null;
@@ -2506,6 +2665,10 @@ function DriveContent({
   viewMode: ViewMode;
   loading: boolean;
   error: string | null;
+  query: string;
+  isRootFolder: boolean;
+  onBack: () => void;
+  onSync: () => void;
 }) {
   if (loading) {
     return (
@@ -2540,10 +2703,40 @@ function DriveContent({
       <div className="flex items-center justify-center p-10">
         <div className="max-w-md rounded-md border border-dashed border-border p-6 text-center">
           <FolderGlyph className="mx-auto mb-3 h-10" />
-          <div className="font-medium">No Drive metadata yet</div>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Run Drive Sync to load Google Drive metadata into Supabase.
-          </p>
+          {query.trim() ? (
+            <>
+              <div className="font-medium">No matches for &ldquo;{query.trim()}&rdquo;</div>
+              <p className="mt-1 text-sm text-muted-foreground">Try a different name, or clear the search.</p>
+            </>
+          ) : isRootFolder ? (
+            <>
+              <div className="font-medium">No Drive metadata yet</div>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Run Drive Sync to load Google Drive metadata into Supabase.
+              </p>
+              <Button variant="outline" size="sm" className="mt-4" onClick={onSync}>
+                <FolderSync className="mr-1.5 h-4 w-4" />
+                Sync Drive
+              </Button>
+            </>
+          ) : (
+            <>
+              <div className="font-medium">This folder is empty</div>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Nothing synced here yet. If you just added files in Drive, sync this folder.
+              </p>
+              <div className="mt-4 flex justify-center gap-2">
+                <Button variant="outline" size="sm" onClick={onBack}>
+                  <ArrowLeft className="mr-1.5 h-4 w-4" />
+                  Back
+                </Button>
+                <Button variant="outline" size="sm" onClick={onSync}>
+                  <FolderSync className="mr-1.5 h-4 w-4" />
+                  Sync folder
+                </Button>
+              </div>
+            </>
+          )}
         </div>
       </div>
     );
@@ -2552,7 +2745,7 @@ function DriveContent({
   return (
     <section className="min-w-0 p-5">
       {viewMode === "grid" ? (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(190px,1fr))] gap-4">
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,190px),240px))] gap-4">
           {items.map((item) => (
             <MediaCard
               key={item.id}
@@ -2740,6 +2933,7 @@ function MediaRow(props: {
 }
 
 function PreviewDrawer({
+  onClose,
   item,
   selectedItem,
   productType,
@@ -2753,6 +2947,9 @@ function PreviewDrawer({
   setSourceStoragePrefix,
   modelReferenceUrl,
   setModelReferenceUrl,
+  styleReferenceUrl,
+  setStyleReferenceUrl,
+  submitNotice,
   onOpenModelPicker,
   outputType,
   setOutputType,
@@ -2781,6 +2978,9 @@ function PreviewDrawer({
   setSourceStoragePrefix: (value: string) => void;
   modelReferenceUrl: string;
   setModelReferenceUrl: (value: string) => void;
+  styleReferenceUrl: string;
+  setStyleReferenceUrl: (value: string) => void;
+  submitNotice: string | null;
   onOpenModelPicker: () => void;
   outputType: OutputType;
   setOutputType: (value: OutputType) => void;
@@ -2795,10 +2995,16 @@ function PreviewDrawer({
   submitting: boolean;
   onSubmit: () => void;
   onOpenFolder: (folder: DriveItem) => void;
+  onClose: () => void;
 }) {
   if (!selectedItem && !item) {
     return (
       <aside className="bg-card p-5">
+        <div className="mb-4 flex justify-end">
+          <Button variant="ghost" size="icon" title="Hide details panel" aria-label="Hide details panel" onClick={onClose}>
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
         <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
           Select a file or folder to preview metadata.
         </div>
@@ -2818,7 +3024,7 @@ function PreviewDrawer({
               : "File Selection"
             : "File Preview"}
         </h3>
-        <Button variant="ghost" size="icon" title="Close preview">
+        <Button variant="ghost" size="icon" title="Hide details panel" aria-label="Hide details panel" onClick={onClose}>
           <X className="h-4 w-4" />
         </Button>
       </div>
@@ -2827,7 +3033,7 @@ function PreviewDrawer({
       {selectedItem ? (
         <div className="mb-4 rounded-md border border-border p-3">
           <div className="mb-2 text-xs font-semibold uppercase text-muted-foreground">Selected Item</div>
-          <div className="font-medium">{selectedItem.name}</div>
+          <div className="font-medium [overflow-wrap:anywhere]">{selectedItem.name}</div>
           <div className="mt-1 text-xs text-muted-foreground">
             {selectedItem.itemType === "FOLDER" ? "Folder" : selectedItem.itemType} · {selectedItem.itemType === "FOLDER" ? "Contains all descendant files" : "Single file"}
           </div>
@@ -2911,17 +3117,33 @@ function PreviewDrawer({
               </div>
             </div>
 
+            {/* Style reference is hidden until the n8n flow is verified with a real provider. */}
+            <div hidden>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">Style Reference URL</label>
+              <Input
+                value={styleReferenceUrl}
+                onChange={(e) => setStyleReferenceUrl(e.target.value)}
+                placeholder="https://... (lighting, composition, mood)"
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                Optional. Public HTTPS link straight to an image — not a Google Drive preview link.
+              </p>
+            </div>
+
             <div>
               <label className="mb-1 block text-xs font-medium text-muted-foreground">Output Type *</label>
               <div role="radiogroup" aria-label="Output Type" className="grid grid-cols-3 gap-2">
                 {OUTPUT_TYPE_OPTIONS.map((option) => (
                   <label
                     key={option.value}
+                    title={option.available ? undefined : "Coming soon — the workflow currently always creates images and a video"}
                     className={cn(
-                      "flex h-10 cursor-pointer items-center justify-center gap-2 rounded-md border text-sm transition-colors",
-                      outputType === option.value
-                        ? "border-primary bg-primary/10 font-medium text-foreground"
-                        : "border-border text-muted-foreground hover:text-foreground",
+                      "flex h-10 items-center justify-center gap-2 rounded-md border text-sm transition-colors",
+                      !option.available
+                        ? "cursor-not-allowed border-border text-muted-foreground/60"
+                        : outputType === option.value
+                          ? "cursor-pointer border-primary bg-primary/10 font-medium text-foreground"
+                          : "cursor-pointer border-border text-muted-foreground hover:text-foreground",
                     )}
                   >
                     <input
@@ -2929,6 +3151,7 @@ function PreviewDrawer({
                       name="output_type"
                       value={option.value}
                       checked={outputType === option.value}
+                      disabled={!option.available}
                       onChange={() => setOutputType(option.value)}
                       className="accent-primary"
                     />
@@ -2936,6 +3159,9 @@ function PreviewDrawer({
                   </label>
                 ))}
               </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Image-only and Video-only are coming soon. Every run currently creates both images and a video.
+              </p>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -2983,6 +3209,11 @@ function PreviewDrawer({
           {submitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}
           {submitting ? "Submitting..." : "Generate Media"}
         </Button>
+        {submitNotice ? (
+          <div role="status" className="rounded-md border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800">
+            {submitNotice}
+          </div>
+        ) : null}
 
         {/* File Preview (if a file is selected) */}
         </div>

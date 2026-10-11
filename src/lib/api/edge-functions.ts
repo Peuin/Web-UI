@@ -260,6 +260,7 @@ export const platformApi = {
         sample_prompt: string;
         source_storage_prefix: string;
         model_reference_url: string | null;
+        style_reference_url?: string;
         output_type: "image" | "video" | "both";
         image_count: number;
         video_seconds: number;
@@ -268,7 +269,11 @@ export const platformApi = {
       };
     },
   ) {
-    return callEdgeFunction<{ job_id: string; status: string; n8n_response?: unknown }>(
+    return callEdgeFunction<{
+      status: string;
+      source_folder?: { drive_item_id?: string; web_view_link?: string } | null;
+      n8n_response?: unknown;
+    }>(
       "workflow-jobs",
       accessToken,
       {
