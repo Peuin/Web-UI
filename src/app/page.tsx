@@ -800,7 +800,7 @@ export default function Home() {
   async function retryRun(runId: string, label: string) {
     if (!accessToken || retryingRunId) return;
     const confirmed = window.confirm(
-      `Chạy lại "${label}"?\n\nLượt chạy lại tạo một batch mới với tham số gốc và sẽ tạo lại ảnh/video (tốn chi phí). Chỉ xác nhận khi chắc lượt trước đã thất bại.`,
+      `Retry "${label}"?\n\nThis starts a new batch with the original settings and generates the images/video again (uses AI credits). Only confirm if you are sure the previous run failed.`,
     );
     if (!confirmed) return;
 
@@ -814,7 +814,7 @@ export default function Home() {
     }
     setJobsNotice({
       tone: "success",
-      text: `Đã gửi chạy lại "${label}". Batch mới sẽ xuất hiện trong danh sách sau vài giây.`,
+      text: `Retry sent for "${label}". The new batch will appear in the list in a few seconds.`,
     });
     void loadJobs(accessToken);
   }
@@ -932,7 +932,7 @@ export default function Home() {
     // Do not auto-retry: there is no idempotency key yet.
     setAppError(null);
     setSubmitNotice(
-      "Đã gửi tới n8n. Workflow chạy nền — kết quả sẽ xuất hiện ở tab thành phẩm khi hoàn tất. Không bấm gửi lại nếu chưa chắc lượt trước bị lỗi.",
+      "Sent to n8n. The workflow runs in the background — results will appear in Final Output when it finishes. Don't submit again unless you're sure the previous run failed.",
     );
     void loadJobs(accessToken);
   }
