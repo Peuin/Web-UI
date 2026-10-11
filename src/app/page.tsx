@@ -84,6 +84,7 @@ type FolderMeta = {
 };
 
 const DEFAULT_CONNECTION_ID = "00000000-0000-0000-0000-000000000000";
+const DRIVE_ROOT_FOLDER_ID = "1RFEes48Mrjcxq5axaifu-i-OmChch6Bb";
 
 // Model tab — Supabase Storage constants
 const MODEL_BUCKET = "BAartworkShopify";
@@ -134,6 +135,30 @@ function isValidStoragePrefix(value: string): boolean {
     'parameters',
   ];
   return !invalidPatterns.some(pattern => value.includes(pattern));
+}
+
+type OutputType = "image" | "video" | "both";
+
+const OUTPUT_TYPE_OPTIONS: { value: OutputType; label: string }[] = [
+  { value: "image", label: "Image" },
+  { value: "video", label: "Video" },
+  { value: "both", label: "Both" },
+];
+
+type ProductTypeOption = { value: string; label: string; category?: string };
+
+// Fallback until baartwork_segformer_profiles loads (or if it cannot be read).
+const DEFAULT_PRODUCT_TYPE_OPTIONS: ProductTypeOption[] = ["cape", "hat", "shawl", "umbrella"].map((value) => ({
+  value,
+  label: formatProductTypeLabel(value),
+}));
+
+function formatProductTypeLabel(productType: string): string {
+  return productType
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 }
 
 function getFolderKeyFromItem(item: DriveItem): string {
@@ -218,10 +243,12 @@ export default function Home() {
 
   // Generation form state
   const [productType, setProductType] = useState("cape");
+  const [productTypeOptions, setProductTypeOptions] = useState<ProductTypeOption[]>(DEFAULT_PRODUCT_TYPE_OPTIONS);
   const [productDescription, setProductDescription] = useState("");
   const [sample_prompt, setSamplePrompt] = useState("");
   const [sourceStoragePrefix, setSourceStoragePrefix] = useState("google-drive/01_New_Product_Raw/ARTIC WIDE LAPEL");
   const [modelReferenceUrl, setModelReferenceUrl] = useState("");
+  const [outputType, setOutputType] = useState<OutputType>("both");
   const [imageCount, setImageCount] = useState("4");
   const [videoSeconds, setVideoSeconds] = useState("8");
   const [aspectRatio, setAspectRatio] = useState("9:16");
@@ -315,7 +342,8 @@ export default function Home() {
   }, []);
 
   const storeFolderChildren = useCallback((key: string, children: DriveItem[], parentName?: string) => {
-    const foldersOnly = children.filter((item) => item.itemType === "FOLDER");
+    // Synced items can reference the parent folder itself; drop them to avoid tree cycles.
+    const foldersOnly = children.filter((item) => item.itemType === "FOLDER" && getFolderKeyFromItem(item) !== key);
     setFolderChildren((current) => ({ ...current, [key]: foldersOnly }));
     setFolderParent((current) => {
       const next = { ...current };
@@ -540,6 +568,31 @@ export default function Home() {
       });
     }
   }, [modelPath, activeTab, loadStorageItems]);
+
+  useEffect(() => {
+    if (!isSignedIn) return;
+    const supabase = createBrowserSupabaseClient();
+    if (!supabase) return;
+
+    supabase
+      .from("baartwork_segformer_profiles")
+      .select("product_type, category_name")
+      .eq("enabled", true)
+      .order("product_type")
+      .then(({ data, error }) => {
+        if (error || !data?.length) {
+          if (error) console.error("Failed to load product types:", error.message);
+          return;
+        }
+        const options = (data as { product_type: string; category_name: string }[]).map((row) => ({
+          value: row.product_type,
+          label: formatProductTypeLabel(row.product_type),
+          category: row.category_name,
+        }));
+        setProductTypeOptions(options);
+        setProductType((current) => (options.some((option) => option.value === current) ? current : options[0].value));
+      });
+  }, [isSignedIn]);
 
   useEffect(() => {
     const supabase = createBrowserSupabaseClient();
@@ -914,7 +967,7 @@ export default function Home() {
       max_folders: number;
     } = {
       connection_id: DEFAULT_CONNECTION_ID,
-      root_folder_id: currentFolder?.driveItemId ?? "1vP62rBKIsfZGPZy7TXHsRwQLdO7pJ4W2",
+      root_folder_id: currentFolder?.driveItemId ?? DRIVE_ROOT_FOLDER_ID,
       sync_mode: "INCREMENTAL",
       recursive: false,
       max_folders: 1,
@@ -980,6 +1033,7 @@ export default function Home() {
         sample_prompt: sample_prompt,
         source_storage_prefix: sourceStoragePrefix,
         model_reference_url: sanitizedModelReferenceUrl,
+        output_type: outputType,
         image_count: parseInt(imageCount, 10),
         video_seconds: parseInt(videoSeconds, 10),
         aspect_ratio: aspectRatio,
@@ -991,7 +1045,7 @@ export default function Home() {
       workflow_type: "media_generation",
       workflow_id: "vcxyqTKCJW29xmWQ",
       connection_id: DEFAULT_CONNECTION_ID,
-      root_folder_id: "1vP62rBKIsfZGPZy7TXHsRwQLdO7pJ4W2",
+      root_folder_id: DRIVE_ROOT_FOLDER_ID,
       selected_item: {
         id: selectedItem.id,
         drive_item_id: selectedItem.driveItemId,
@@ -1015,6 +1069,7 @@ export default function Home() {
         sample_prompt: sample_prompt,
         source_storage_prefix: sourceStoragePrefix,
         model_reference_url: sanitizedModelReferenceUrl ?? "",
+        output_type: outputType,
         image_count: parseInt(imageCount, 10),
         video_seconds: parseInt(videoSeconds, 10),
         aspect_ratio: aspectRatio,
@@ -1118,6 +1173,7 @@ export default function Home() {
                 selectedItem={selectedItem}
                 productType={productType}
                 setProductType={setProductType}
+                productTypeOptions={productTypeOptions}
                 productDescription={productDescription}
                 setProductDescription={setProductDescription}
                 sample_prompt={sample_prompt}
@@ -1127,6 +1183,8 @@ export default function Home() {
                 modelReferenceUrl={modelReferenceUrl}
                 setModelReferenceUrl={setModelReferenceUrl}
                 onOpenModelPicker={openModelPicker}
+                outputType={outputType}
+                setOutputType={setOutputType}
                 imageCount={imageCount}
                 setImageCount={setImageCount}
                 videoSeconds={videoSeconds}
@@ -2327,9 +2385,12 @@ function FolderTree({
   onNavigate: (key: string) => void;
   onToggle: (key: string) => void;
 }) {
-  function renderNode(item: DriveItem, depth: number) {
+  function renderNode(item: DriveItem, depth: number, ancestors: Set<string> = new Set()) {
     const key = getFolderKeyFromItem(item);
-    const children = folderChildren[key];
+    // Guard against cyclic folder data (e.g. synced items pointing back to an ancestor).
+    if (ancestors.has(key)) return null;
+    const lineage = new Set(ancestors).add(key);
+    const children = folderChildren[key]?.filter((child) => !lineage.has(getFolderKeyFromItem(child)));
     const isExpanded = expanded.has(key);
     const isCurrent = currentKey === key;
     const isLoading = loadingKeys.has(key);
@@ -2374,7 +2435,7 @@ function FolderTree({
             <span className="truncate">{item.name}</span>
           </button>
         </div>
-        {isExpanded && children?.length ? children.map((child) => renderNode(child, depth + 1)) : null}
+        {isExpanded && children?.length ? children.map((child) => renderNode(child, depth + 1, lineage)) : null}
         {isExpanded && hasKnownNoChildren ? (
           <div className="h-8 py-1 text-xs italic text-muted-foreground" style={{ paddingLeft: 8 + (depth + 1) * 16 }}>
             No subfolders
@@ -2683,6 +2744,7 @@ function PreviewDrawer({
   selectedItem,
   productType,
   setProductType,
+  productTypeOptions,
   productDescription,
   setProductDescription,
   sample_prompt,
@@ -2692,6 +2754,8 @@ function PreviewDrawer({
   modelReferenceUrl,
   setModelReferenceUrl,
   onOpenModelPicker,
+  outputType,
+  setOutputType,
   imageCount,
   setImageCount,
   videoSeconds,
@@ -2708,6 +2772,7 @@ function PreviewDrawer({
   selectedItem: DriveItem | null;
   productType: string;
   setProductType: (value: string) => void;
+  productTypeOptions: ProductTypeOption[];
   productDescription: string;
   setProductDescription: (value: string) => void;
   sample_prompt: string;
@@ -2717,6 +2782,8 @@ function PreviewDrawer({
   modelReferenceUrl: string;
   setModelReferenceUrl: (value: string) => void;
   onOpenModelPicker: () => void;
+  outputType: OutputType;
+  setOutputType: (value: OutputType) => void;
   imageCount: string;
   setImageCount: (value: string) => void;
   videoSeconds: string;
@@ -2780,10 +2847,11 @@ function PreviewDrawer({
             <div>
               <label className="mb-1 block text-xs font-medium text-muted-foreground">Product Type *</label>
               <Select value={productType} onChange={(e) => setProductType(e.target.value)}>
-                <option value="hat">Hat</option>
-                <option value="shawl">Shawl</option>
-                <option value="umbrella">Umbrella</option>
-                <option value="cape">Cape</option>
+                {productTypeOptions.map((option) => (
+                  <option key={option.value} value={option.value} title={option.category}>
+                    {option.label}
+                  </option>
+                ))}
               </Select>
             </div>
 
@@ -2840,6 +2908,33 @@ function PreviewDrawer({
                     Browse
                   </Button>
                 </div>
+              </div>
+            </div>
+
+            <div>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">Output Type *</label>
+              <div role="radiogroup" aria-label="Output Type" className="grid grid-cols-3 gap-2">
+                {OUTPUT_TYPE_OPTIONS.map((option) => (
+                  <label
+                    key={option.value}
+                    className={cn(
+                      "flex h-10 cursor-pointer items-center justify-center gap-2 rounded-md border text-sm transition-colors",
+                      outputType === option.value
+                        ? "border-primary bg-primary/10 font-medium text-foreground"
+                        : "border-border text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    <input
+                      type="radio"
+                      name="output_type"
+                      value={option.value}
+                      checked={outputType === option.value}
+                      onChange={() => setOutputType(option.value)}
+                      className="accent-primary"
+                    />
+                    {option.label}
+                  </label>
+                ))}
               </div>
             </div>
 

@@ -260,6 +260,7 @@ export const platformApi = {
         sample_prompt: string;
         source_storage_prefix: string;
         model_reference_url: string | null;
+        output_type: "image" | "video" | "both";
         image_count: number;
         video_seconds: number;
         aspect_ratio: string;
