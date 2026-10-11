@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  Activity,
   ArrowLeft,
   BellRing,
   Check,
@@ -63,10 +62,9 @@ import type {
   ApiDriveItem,
   DriveItem,
   DriveItemType,
-  FinalDateFilter,
-  FinalFile,
   StorageBreadcrumb,
   StorageItem,
+  JobFolderRun,
   WorkflowJob,
   WorkflowStatus,
 } from "@/types/domain";
@@ -87,7 +85,10 @@ type FolderMeta = {
 };
 
 const DEFAULT_CONNECTION_ID = "00000000-0000-0000-0000-000000000000";
-const DRIVE_ROOT_FOLDER_ID = "1RFEes48Mrjcxq5axaifu-i-OmChch6Bb";
+const DRIVE_ROOT_FOLDER_ID = "1vP62rBKIsfZGPZy7TXHsRwQLdO7pJ4W2";
+// Generated output root (output_config.folder_id → "02_AI_PROCESSING").
+const FINAL_ROOT_FOLDER_ID = "1RFEes48Mrjcxq5axaifu-i-OmChch6Bb";
+const FINAL_ROOT_FOLDER_NAME = "02_AI_PROCESSING";
 
 // Model tab — Supabase Storage constants
 const MODEL_BUCKET = "BAartworkShopify";
@@ -236,6 +237,8 @@ export default function Home() {
   const [selectedItem, setSelectedItem] = useState<DriveItem | null>(null);
   const [previewItem, setPreviewItem] = useState<DriveItem | null>(null);
   const [activeJob, setActiveJob] = useState<WorkflowJob | null>(null);
+  const [retryingRunId, setRetryingRunId] = useState<string | null>(null);
+  const [jobsNotice, setJobsNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const [loadingDrive, setLoadingDrive] = useState(false);
   const [loadingJobs, setLoadingJobs] = useState(false);
   const [appError, setAppError] = useState<string | null>(null);
@@ -285,12 +288,6 @@ export default function Home() {
   const [videoResolution, setVideoResolution] = useState("480p");
 
   // Final files state
-  const [finalFiles, setFinalFiles] = useState<FinalFile[]>([]);
-  const [finalLoading, setFinalLoading] = useState(false);
-  const [finalError, setFinalError] = useState<string | null>(null);
-  const [dateFilter, setDateFilter] = useState<FinalDateFilter>("all");
-  const [customFromDate, setCustomFromDate] = useState("");
-  const [customToDate, setCustomToDate] = useState("");
 
   const folders = useMemo(() => items.filter((i) => i.itemType === "FOLDER" && !isHiddenDrivePlaceholder(i)), [items]);
 
@@ -588,54 +585,16 @@ export default function Home() {
 
     const normalizedJobs = response.data.jobs.map(normalizeWorkflowJob);
     setJobs(normalizedJobs);
-    setActiveJob(normalizedJobs[0] ?? null);
+    // Keep the inspected batch selected across refreshes.
+    setActiveJob((current) => normalizedJobs.find((job) => job.id === current?.id) ?? normalizedJobs[0] ?? null);
   }, []);
 
-  const loadFinalFiles = useCallback(async (token: string) => {
-    setFinalLoading(true);
-    setFinalError(null);
-
-    const filters: {
-      from_date?: string;
-      to_date?: string;
-      limit?: number;
-    } = {};
-    if (dateFilter === "today") {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      filters.from_date = today.toISOString();
-    } else if (dateFilter === "7days") {
-      const weekAgo = new Date();
-      weekAgo.setDate(weekAgo.getDate() - 7);
-      filters.from_date = weekAgo.toISOString();
-    } else if (dateFilter === "30days") {
-      const monthAgo = new Date();
-      monthAgo.setDate(monthAgo.getDate() - 30);
-      filters.from_date = monthAgo.toISOString();
-    } else if (dateFilter === "custom") {
-      if (customFromDate) {
-        filters.from_date = new Date(`${customFromDate}T00:00:00`).toISOString();
-      }
-      if (customToDate) {
-        filters.to_date = new Date(`${customToDate}T23:59:59.999`).toISOString();
-      }
-    }
-
-    const response = await platformApi.listFinalFiles(token, filters);
-    setFinalLoading(false);
-
-    if (!response.success || !response.data) {
-      setFinalFiles([]);
-      setFinalError(response.error?.message ?? "Could not load generated files.");
-      return;
-    }
-
-    setFinalFiles(response.data.files);
-  }, [customFromDate, customToDate, dateFilter]);
 
   useEffect(() => {
     try {
-      if (localStorage.getItem(PREVIEW_PANEL_STORAGE_KEY) === "closed") setPreviewPanelOpen(false);
+      if (localStorage.getItem(PREVIEW_PANEL_STORAGE_KEY) === "closed") {
+        queueMicrotask(() => setPreviewPanelOpen(false));
+      }
     } catch {
       // Storage unavailable (private mode etc.); keep the default.
     }
@@ -718,11 +677,6 @@ export default function Home() {
     };
   }, [loadDrive, loadJobs]);
 
-  useEffect(() => {
-    if (activeTab === "final" && accessToken) {
-      void Promise.resolve().then(() => loadFinalFiles(accessToken));
-    }
-  }, [activeTab, accessToken, loadFinalFiles]);
 
   // Storage path of a selected folder, used to prefill "Source Storage Prefix".
   // Prefer the path stored in DB; otherwise derive it from the open folder path.
@@ -871,8 +825,6 @@ export default function Home() {
     setSelectedItem(null);
     setPreviewItem(null);
     setActiveJob(null);
-    setFinalFiles([]);
-    setFinalError(null);
     setAppError(null);
   }
 
@@ -1083,6 +1035,37 @@ export default function Home() {
       currentFolder?.connectionId === "storage" ? null : currentFolder?.driveItemId ?? null,
       currentFolder?.connectionId === "storage" ? currentFolder.driveItemId : null,
     );
+  }
+
+  // Poll while the Jobs tab is open and something is still running.
+  const hasActiveJobs = jobs.some((job) => job.status === "QUEUED" || job.status === "PROCESSING");
+  useEffect(() => {
+    if (activeTab !== "jobs" || !accessToken) return;
+    if (!hasActiveJobs) return;
+    const timer = setInterval(() => void loadJobs(accessToken), JOBS_POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [activeTab, accessToken, hasActiveJobs, loadJobs]);
+
+  async function retryRun(runId: string, label: string) {
+    if (!accessToken || retryingRunId) return;
+    const confirmed = window.confirm(
+      `Chạy lại "${label}"?\n\nLượt chạy lại tạo một batch mới với tham số gốc và sẽ tạo lại ảnh/video (tốn chi phí). Chỉ xác nhận khi chắc lượt trước đã thất bại.`,
+    );
+    if (!confirmed) return;
+
+    setRetryingRunId(runId);
+    setJobsNotice(null);
+    const response = await platformApi.retryJob(accessToken, runId);
+    setRetryingRunId(null);
+    if (!response.success) {
+      setJobsNotice({ tone: "error", text: response.error?.message ?? "Could not retry this run." });
+      return;
+    }
+    setJobsNotice({
+      tone: "success",
+      text: `Đã gửi chạy lại "${label}". Batch mới sẽ xuất hiện trong danh sách sau vài giây.`,
+    });
+    void loadJobs(accessToken);
   }
 
   async function submitWorkflow() {
@@ -1419,23 +1402,14 @@ export default function Home() {
               jobs={jobs}
               loading={loadingJobs}
               onSelectJob={setActiveJob}
+              onRetry={retryRun}
+              retryingRunId={retryingRunId}
+              notice={jobsNotice}
+              onRefresh={() => accessToken && void loadJobs(accessToken)}
             />
           ) : null}
 
-          {activeTab === "final" ? (
-            <FinalPage
-              files={finalFiles}
-              loading={finalLoading}
-              error={finalError}
-              dateFilter={dateFilter}
-              setDateFilter={setDateFilter}
-              customFromDate={customFromDate}
-              setCustomFromDate={setCustomFromDate}
-              customToDate={customToDate}
-              setCustomToDate={setCustomToDate}
-              onRefresh={() => accessToken ? void loadFinalFiles(accessToken) : undefined}
-            />
-          ) : null}
+          {activeTab === "final" && accessToken ? <FinalBrowser accessToken={accessToken} /> : null}
 
           {activeTab === "settings" ? <SettingsPage /> : null}
         </section>
@@ -3295,319 +3269,708 @@ function Info({ label, value }: { label: string; value: string }) {
   );
 }
 
+const JOBS_POLL_INTERVAL_MS = 15_000;
+const JOB_GRID = "grid grid-cols-[minmax(0,1.8fr)_90px_140px_110px_130px_120px_88px] gap-3";
+
+const RAW_STATUS_LABEL: Record<string, string> = {
+  queued_scan: "Queued scan",
+  scanning: "Scanning",
+  ready: "Ready",
+  processing: "Processing",
+  completed: "Completed",
+  skipped: "Skipped",
+  failed: "Failed",
+  partial_failed: "Partially failed",
+  canceled: "Canceled",
+};
+
+const RETRY_ACTION_LABEL: Record<string, string> = {
+  recovery_existing_assets: "Can recover from saved outputs",
+  resume_anchor_checkpoint: "Can resume from checkpoint",
+  restart_generation_requires_approval: "Restart needs approval",
+  manual_review: "Needs manual review",
+};
+
+function statusLabel(status: WorkflowStatus, rawStatus?: string) {
+  return (rawStatus && RAW_STATUS_LABEL[rawStatus]) ?? status;
+}
+
+/** Depth-first order of the scan tree so children render under their parent. */
+function orderFolderTree(folders: JobFolderRun[]): JobFolderRun[] {
+  const ids = new Set(folders.map((folder) => folder.runId));
+  const children = new Map<string | null, JobFolderRun[]>();
+  for (const folder of folders) {
+    const parent = folder.parentRunId && ids.has(folder.parentRunId) ? folder.parentRunId : null;
+    children.set(parent, [...(children.get(parent) ?? []), folder]);
+  }
+  const ordered: JobFolderRun[] = [];
+  const visited = new Set<string>();
+  const walk = (parent: string | null) => {
+    const list = (children.get(parent) ?? []).sort((a, b) =>
+      (a.sourcePath ?? a.name).localeCompare(b.sourcePath ?? b.name),
+    );
+    for (const folder of list) {
+      if (visited.has(folder.runId)) continue;
+      visited.add(folder.runId);
+      ordered.push(folder);
+      walk(folder.runId);
+    }
+  };
+  walk(null);
+  return ordered;
+}
+
+/** What the user picked in Generate Media (file or folder), falling back to the scanned root folder. */
+function jobLabel(job: WorkflowJob) {
+  return job.selectedName ?? job.sourceName ?? `batch ${job.id.slice(0, 8)}`;
+}
+
+function folderCounts(job: WorkflowJob) {
+  const done = job.folders.filter((folder) => folder.rawStatus === "completed").length;
+  const failed = job.folders.filter((folder) => folder.status === "FAILED").length;
+  return { done, failed, total: job.folders.length };
+}
+
+function RetryButton({
+  runId,
+  label,
+  retryingRunId,
+  onRetry,
+  size = "sm",
+}: {
+  runId: string;
+  label: string;
+  retryingRunId: string | null;
+  onRetry: (runId: string, label: string) => void;
+  size?: "sm" | "icon";
+}) {
+  const busy = retryingRunId === runId;
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      className={cn("shrink-0", size === "icon" && "h-7 px-2 text-xs")}
+      disabled={Boolean(retryingRunId)}
+      onClick={(event) => {
+        event.stopPropagation();
+        onRetry(runId, label);
+      }}
+      title={`Retry ${label}`}
+    >
+      {busy ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1 h-3.5 w-3.5" />}
+      Retry
+    </Button>
+  );
+}
+
 function JobsPage({
   activeJob,
   jobs,
   loading,
   onSelectJob,
+  onRetry,
+  retryingRunId,
+  notice,
+  onRefresh,
 }: {
   activeJob: WorkflowJob | null;
   jobs: WorkflowJob[];
   loading: boolean;
   onSelectJob: (job: WorkflowJob) => void;
+  onRetry: (runId: string, label: string) => void;
+  retryingRunId: string | null;
+  notice: { tone: "success" | "error"; text: string } | null;
+  onRefresh: () => void;
 }) {
+  const [expandedJobIds, setExpandedJobIds] = useState<Set<string>>(new Set());
+  const toggleJob = (id: string) =>
+    setExpandedJobIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
   return (
-    <div className="grid flex-1 grid-cols-[minmax(0,1fr)_360px]">
+    <div className="grid flex-1 grid-cols-[minmax(0,1fr)_420px]">
       <section className="min-w-0 p-5">
         <div className="mb-4 flex items-center justify-between">
           <div>
             <h2 className="text-lg font-semibold">Workflow Jobs</h2>
-            <p className="text-sm text-muted-foreground">Realtime-ready status tracking from Supabase</p>
+            <p className="text-sm text-muted-foreground">
+              Each row is one Generate Media submission (n8n batch) with its folder scan tree.
+            </p>
           </div>
-          <Badge variant="info">
-            <Activity className="mr-1 h-3.5 w-3.5" />
-            Subscribed
-          </Badge>
+          <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
+            {loading ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
+            Refresh
+          </Button>
         </div>
+        {notice ? (
+          <div
+            role="status"
+            className={cn(
+              "mb-4 rounded-md border p-3 text-sm",
+              notice.tone === "success"
+                ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                : "border-red-200 bg-red-50 text-red-700",
+            )}
+          >
+            {notice.text}
+          </div>
+        ) : null}
         <div className="overflow-hidden rounded-md border border-border bg-card">
-          <div className="grid grid-cols-[110px_160px_150px_140px_120px_120px] border-b border-border px-4 py-3 text-xs font-semibold uppercase text-muted-foreground">
-            <span>Job ID</span>
-            <span>Workflow</span>
+          <div className={cn(JOB_GRID, "border-b border-border px-4 py-3 text-xs font-semibold uppercase text-muted-foreground")}>
+            <span>Batch / folder</span>
+            <span>Product</span>
             <span>Status</span>
             <span>Progress</span>
-            <span>Files</span>
+            <span>Folders · images</span>
             <span>Created</span>
+            <span />
           </div>
-          {loading ? (
+          {loading && jobs.length === 0 ? (
             <div className="p-6 text-sm text-muted-foreground">Loading workflow jobs...</div>
           ) : null}
           {!loading && jobs.length === 0 ? (
             <div className="p-6 text-sm text-muted-foreground">
-              No workflow jobs yet. Select files in Drive Browser and run a workflow.
+              No workflow jobs yet. Select a folder in Drive Browser and run Generate Media.
             </div>
           ) : null}
-          {jobs.map((job) => (
-            <button
-              key={job.id}
-              className={cn(
-                "grid w-full grid-cols-[110px_160px_150px_140px_120px_120px] items-center border-b border-border px-4 py-3 text-left last:border-b-0 hover:bg-secondary",
-                activeJob?.id === job.id && "bg-primary/5",
-              )}
-              onClick={() => onSelectJob(job)}
-            >
-              <span className="font-mono text-xs">{job.id}</span>
-              <span className="truncate text-sm font-medium">{job.workflowType}</span>
-              <Badge variant={statusVariant[job.status]}>{job.status}</Badge>
-              <div className="pr-4">
-                <Progress value={job.progress} />
+          {jobs.map((job) => {
+            const counts = folderCounts(job);
+            const label = jobLabel(job);
+            const isOpen = expandedJobIds.has(job.id);
+            const isFile = job.selectedType && job.selectedType !== "FOLDER";
+            return (
+              <div key={job.id} className="border-b border-border last:border-b-0">
+                <div
+                  role="button"
+                  tabIndex={0}
+                  aria-expanded={isOpen}
+                  className={cn(
+                    JOB_GRID,
+                    "w-full cursor-pointer items-center px-4 py-3 text-left hover:bg-secondary",
+                    activeJob?.id === job.id && "bg-primary/5",
+                  )}
+                  onClick={() => {
+                    onSelectJob(job);
+                    toggleJob(job.id);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      onSelectJob(job);
+                      toggleJob(job.id);
+                    }
+                  }}
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    <ChevronRight
+                      className={cn(
+                        "h-4 w-4 shrink-0 text-muted-foreground transition-transform",
+                        isOpen && "rotate-90",
+                        counts.total === 0 && "invisible",
+                      )}
+                    />
+                    {isFile ? (
+                      <FileImage className="h-4 w-4 shrink-0 text-muted-foreground" />
+                    ) : (
+                      <FolderGlyph className="h-4 shrink-0" />
+                    )}
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium" title={label}>{label}</div>
+                      <div className="truncate font-mono text-[11px] text-muted-foreground">
+                        {job.id.slice(0, 8)}
+                        {job.sourceName && job.sourceName !== label ? ` · in ${job.sourceName}` : ""}
+                      </div>
+                    </div>
+                  </div>
+                  <span className="truncate text-sm capitalize">{job.productType ?? "—"}</span>
+                  <Badge variant={statusVariant[job.status]}>{statusLabel(job.status, job.rawStatus)}</Badge>
+                  <Progress value={job.progress} />
+                  <span className="text-sm text-muted-foreground">
+                    {counts.done}/{counts.total}
+                    {counts.failed ? <span className="ml-1 text-red-600">· {counts.failed} failed</span> : null}
+                  </span>
+                  <span className="text-xs text-muted-foreground">{formatDate(job.createdAt)}</span>
+                  <div className="flex justify-end">
+                    {job.canRetry ? (
+                      <RetryButton runId={job.id} label={label} retryingRunId={retryingRunId} onRetry={onRetry} size="icon" />
+                    ) : null}
+                  </div>
+                </div>
+                {isOpen
+                  ? orderFolderTree(job.folders).map((folder) => (
+                      <div
+                        key={folder.runId}
+                        className={cn(
+                          JOB_GRID,
+                          "items-center border-t border-border/60 bg-background/60 px-4 py-2 text-left",
+                          folder.status === "FAILED" && "bg-red-50/60",
+                        )}
+                      >
+                        <div className="flex min-w-0 items-center gap-2" style={{ paddingLeft: 24 + folder.depth * 18 }}>
+                          <FolderGlyph className="h-3.5 shrink-0" />
+                          <div className="min-w-0">
+                            <div className="truncate text-sm" title={folder.sourcePath ?? folder.name}>{folder.name}</div>
+                            {folder.errorMessage ? (
+                              <div className="truncate text-[11px] text-red-700" title={folder.errorMessage}>
+                                {folder.errorMessage}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                        <span />
+                        <Badge variant={statusVariant[folder.status]}>{statusLabel(folder.status, folder.rawStatus)}</Badge>
+                        <span />
+                        <span className="text-xs text-muted-foreground">
+                          {folder.imageCount !== null ? `${folder.imageCount} images` : "Not scanned"}
+                          {folder.childFolderCount ? ` · ${folder.childFolderCount} sub` : ""}
+                        </span>
+                        <span className="text-xs text-muted-foreground">{formatDate(folder.updatedAt ?? folder.startedAt)}</span>
+                        <div className="flex justify-end">
+                          {folder.canRetry ? (
+                            <RetryButton
+                              runId={folder.runId}
+                              label={folder.name}
+                              retryingRunId={retryingRunId}
+                              onRetry={onRetry}
+                              size="icon"
+                            />
+                          ) : null}
+                        </div>
+                      </div>
+                    ))
+                  : null}
               </div>
-              <span className="text-sm text-muted-foreground">{job.inputFiles}</span>
-              <span className="text-xs text-muted-foreground">{formatDate(job.createdAt)}</span>
-            </button>
-          ))}
+            );
+          })}
         </div>
       </section>
-      <JobDetail job={activeJob} />
+      <JobDetail job={activeJob} onRetry={onRetry} retryingRunId={retryingRunId} />
     </div>
   );
 }
 
-function JobDetail({ job }: { job: WorkflowJob | null }) {
+function JobDetail({
+  job,
+  onRetry,
+  retryingRunId,
+}: {
+  job: WorkflowJob | null;
+  onRetry: (runId: string, label: string) => void;
+  retryingRunId: string | null;
+}) {
   if (!job) {
     return (
       <aside className="border-l border-border bg-card p-5">
         <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
-          Select a workflow job to inspect its timeline.
+          Select a batch to inspect its folders.
         </div>
       </aside>
     );
   }
 
-  const steps: WorkflowStatus[] = ["QUEUED", "PROCESSING", "WAITING_EXTERNAL", "COMPLETED"];
+  const folders = orderFolderTree(job.folders);
+  const counts = folderCounts(job);
+  const label = jobLabel(job);
 
   return (
-    <aside className="border-l border-border bg-card p-5">
-      <div className="mb-4">
-        <Badge variant={statusVariant[job.status]}>{job.status}</Badge>
-        <h3 className="mt-3 text-lg font-semibold">{job.workflowType}</h3>
-        <p className="font-mono text-xs text-muted-foreground">{job.id}</p>
+    <aside className="overflow-auto border-l border-border bg-card p-5">
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <Badge variant={statusVariant[job.status]}>{statusLabel(job.status, job.rawStatus)}</Badge>
+          <h3 className="mt-3 truncate text-lg font-semibold" title={label}>{label}</h3>
+          <p className="font-mono text-xs text-muted-foreground">{job.id}</p>
+        </div>
+        {job.canRetry ? (
+          <RetryButton runId={job.id} label={label} retryingRunId={retryingRunId} onRetry={onRetry} />
+        ) : null}
       </div>
-      <Progress value={job.progress} className="mb-5" />
-      <div className="space-y-4">
-        {steps.map((step) => (
-          <div key={step} className="flex items-center gap-3">
-            <div
-              className={cn(
-                "flex h-7 w-7 items-center justify-center rounded-full border",
-                step === job.status || job.status === "COMPLETED"
-                  ? "border-primary bg-primary text-primary-foreground"
-                  : "border-border bg-background text-muted-foreground",
-              )}
-            >
-              <Check className="h-3.5 w-3.5" />
-            </div>
-            <div>
-              <div className="text-sm font-medium">{step}</div>
-              <div className="text-xs text-muted-foreground">Async n8n workflow checkpoint</div>
-            </div>
-          </div>
-        ))}
+      <Progress value={job.progress} className="mb-2" />
+      <div className="mb-5 text-xs text-muted-foreground">
+        {counts.done} of {counts.total} folders completed
+        {counts.failed ? ` · ${counts.failed} failed` : ""} · started {formatDate(job.startedAt ?? job.createdAt)}
       </div>
-      {job.status === "FAILED" ? (
-        <div className="mt-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-          <CircleAlert className="mb-2 h-4 w-4" />
+
+      {job.errorMessage ? (
+        <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+          <CircleAlert className="mb-1 h-4 w-4" />
           {job.errorMessage}
         </div>
       ) : null}
+
+      <div className="mb-2 text-xs font-semibold uppercase text-muted-foreground">Folders</div>
+      {folders.length === 0 ? (
+        <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
+          No folders scanned for this batch yet.
+        </div>
+      ) : (
+        <ul className="space-y-1">
+          {folders.map((folder) => (
+            <li
+              key={folder.runId}
+              className={cn(
+                "rounded-md border border-transparent py-2 pr-2",
+                folder.status === "FAILED" && "border-red-200 bg-red-50/60",
+              )}
+              style={{ paddingLeft: 8 + folder.depth * 16 }}
+            >
+              <div className="flex items-center gap-2">
+                <FolderGlyph className="h-4 shrink-0" />
+                <span className="min-w-0 flex-1 truncate text-sm" title={folder.sourcePath ?? folder.name}>
+                  {folder.name}
+                </span>
+                <Badge variant={statusVariant[folder.status]}>{statusLabel(folder.status, folder.rawStatus)}</Badge>
+                {folder.canRetry ? (
+                  <RetryButton
+                    runId={folder.runId}
+                    label={folder.name}
+                    retryingRunId={retryingRunId}
+                    onRetry={onRetry}
+                    size="icon"
+                  />
+                ) : null}
+              </div>
+              <div className="mt-0.5 pl-6 text-xs text-muted-foreground">
+                {folder.imageCount !== null ? `${folder.imageCount} images` : "Not scanned"}
+                {folder.childFolderCount ? ` · ${folder.childFolderCount} subfolders` : ""}
+                {folder.attempt && folder.attempt > 1 ? ` · attempt ${folder.attempt}` : ""}
+                {folder.retryAction && RETRY_ACTION_LABEL[folder.retryAction]
+                  ? ` · ${RETRY_ACTION_LABEL[folder.retryAction]}`
+                  : ""}
+              </div>
+              {folder.errorMessage ? (
+                <div className="mt-1 break-words pl-6 text-xs text-red-700">{folder.errorMessage}</div>
+              ) : null}
+              {folder.files.length ? (
+                <ul className="mt-1.5 space-y-0.5 pl-6">
+                  {folder.files.map((file) => (
+                    <li key={file.id} className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+                      <FileImage className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate" title={file.name ?? file.id}>{file.name ?? file.id}</span>
+                    </li>
+                  ))}
+                  {folder.imageCount && folder.imageCount > folder.files.length ? (
+                    <li className="text-xs text-muted-foreground">+{folder.imageCount - folder.files.length} more</li>
+                  ) : null}
+                </ul>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      )}
     </aside>
   );
 }
 
-function FinalPage({
-  files,
-  loading,
-  error,
-  dateFilter,
-  setDateFilter,
-  customFromDate,
-  setCustomFromDate,
-  customToDate,
-  setCustomToDate,
-  onRefresh,
-}: {
-  files: FinalFile[];
-  loading: boolean;
-  error: string | null;
-  dateFilter: FinalDateFilter;
-  setDateFilter: (filter: FinalDateFilter) => void;
-  customFromDate: string;
-  setCustomFromDate: (value: string) => void;
-  customToDate: string;
-  setCustomToDate: (value: string) => void;
-  onRefresh: () => void;
-}) {
-  const filterOptions: Array<{ id: FinalDateFilter; label: string }> = [
-    { id: "all", label: "All" },
-    { id: "today", label: "Today" },
-    { id: "7days", label: "Last 7 days" },
-    { id: "30days", label: "Last 30 days" },
-    { id: "custom", label: "Custom" },
-  ];
+// ─── Final Output tab: browse the generated-output Drive tree ─────────────────
+
+function driveDownloadUrl(item: DriveItem) {
+  return `https://drive.google.com/uc?export=download&id=${encodeURIComponent(item.driveItemId)}`;
+}
+
+function driveOpenUrl(item: DriveItem) {
+  if (item.itemType === "FOLDER") return `https://drive.google.com/drive/folders/${encodeURIComponent(item.driveItemId)}`;
+  return stripMarkdownLink(item.webViewLink) ?? `https://drive.google.com/file/d/${encodeURIComponent(item.driveItemId)}/view`;
+}
+
+type FinalFolderMeta = { name: string; parentId: string | null };
+
+function FinalBrowser({ accessToken }: { accessToken: string }) {
+  const [currentId, setCurrentId] = useState(FINAL_ROOT_FOLDER_ID);
+  const [items, setItems] = useState<DriveItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [query, setQuery] = useState("");
+  const [viewMode, setViewMode] = useState<ViewMode>("grid");
+  const [previewItem, setPreviewItem] = useState<DriveItem | null>(null);
+  const [panelOpen, setPanelOpen] = useState(true);
+  const [meta, setMeta] = useState<Record<string, FinalFolderMeta>>({
+    [FINAL_ROOT_FOLDER_ID]: { name: FINAL_ROOT_FOLDER_NAME, parentId: null },
+  });
+  const [folderChildren, setFolderChildren] = useState<Record<string, DriveItem[]>>({});
+  const [expanded, setExpanded] = useState<Set<string>>(new Set([FINAL_ROOT_FOLDER_ID]));
+  const [loadingKeys, setLoadingKeys] = useState<Set<string>>(new Set());
+  const syncedRef = useRef(new Set<string>());
+  const requestRef = useRef(0);
+
+  const listFolder = useCallback(async (folderId: string) => {
+    const params = new URLSearchParams({
+      connection_id: DEFAULT_CONNECTION_ID,
+      folder_id: folderId,
+      page: "1",
+      page_size: "500",
+      sort: "modified_desc",
+    });
+    const response = await platformApi.listFolder(accessToken, params);
+    if (!response.success || !response.data) {
+      return { ok: false as const, error: response.error?.message ?? "Could not load folder.", items: [] as DriveItem[] };
+    }
+    const list = response.data.items.filter((item) => !isHiddenDrivePlaceholder(item)).map(normalizeDriveItem);
+    return { ok: true as const, error: null, items: list };
+  }, [accessToken]);
+
+  // Same lazy sync as Drive Browser: pull a folder from Drive the first time it is empty.
+  const fetchFolder = useCallback(async (folderId: string, force = false) => {
+    let result = await listFolder(folderId);
+    if (!result.ok || (result.items.length > 0 && !force) || (!force && syncedRef.current.has(folderId))) return result;
+    syncedRef.current.add(folderId);
+    const sync = await platformApi.syncDrive(accessToken, {
+      connection_id: DEFAULT_CONNECTION_ID,
+      root_folder_id: folderId,
+      sync_mode: "INCREMENTAL",
+      recursive: false,
+      max_folders: 1,
+    });
+    if (!sync.success) return { ...result, error: sync.error?.message ?? "Could not sync folder." };
+    for (const delayMs of [0, 2000, 4000]) {
+      if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      result = await listFolder(folderId);
+      if (!result.ok || result.items.length > 0) return result;
+    }
+    return result;
+  }, [accessToken, listFolder]);
+
+  const rememberFolders = useCallback((parentId: string, list: DriveItem[]) => {
+    const folders = list.filter((item) => item.itemType === "FOLDER" && item.driveItemId !== parentId);
+    setFolderChildren((current) => ({ ...current, [parentId]: folders }));
+    setMeta((current) => {
+      const next = { ...current };
+      for (const folder of folders) next[folder.driveItemId] = { name: folder.name, parentId };
+      return next;
+    });
+  }, []);
+
+  const openFolderId = useCallback(async (folderId: string, force = false) => {
+    const requestId = ++requestRef.current;
+    setCurrentId(folderId);
+    setQuery("");
+    setPreviewItem(null);
+    setLoading(true);
+    setError(null);
+    const result = await fetchFolder(folderId, force);
+    if (requestId !== requestRef.current) return;
+    setLoading(false);
+    setItems(result.items);
+    if (result.error) setError(result.error);
+    rememberFolders(folderId, result.items);
+    setExpanded((current) => new Set(current).add(folderId));
+  }, [fetchFolder, rememberFolders]);
+
+  useEffect(() => {
+    queueMicrotask(() => void openFolderId(FINAL_ROOT_FOLDER_ID));
+  }, [openFolderId]);
+
+  async function toggleTreeFolder(folderId: string) {
+    const isOpen = expanded.has(folderId);
+    setExpanded((current) => {
+      const next = new Set(current);
+      if (isOpen) next.delete(folderId);
+      else next.add(folderId);
+      return next;
+    });
+    if (isOpen || folderChildren[folderId]) return;
+    setLoadingKeys((current) => new Set(current).add(folderId));
+    const result = await fetchFolder(folderId);
+    setLoadingKeys((current) => {
+      const next = new Set(current);
+      next.delete(folderId);
+      return next;
+    });
+    if (result.ok) rememberFolders(folderId, result.items);
+  }
+
+  const breadcrumbs: FolderCrumb[] = useMemo(() => {
+    const chain: FolderCrumb[] = [];
+    const seen = new Set<string>();
+    let cursor: string | null = currentId;
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      chain.unshift({ driveItemId: cursor, name: meta[cursor]?.name ?? "Folder", key: cursor });
+      cursor = meta[cursor]?.parentId ?? null;
+    }
+    return chain;
+  }, [currentId, meta]);
+
+  const visibleItems = query.trim()
+    ? items.filter((item) => item.name.toLowerCase().includes(query.trim().toLowerCase()))
+    : items;
+  const folderCount = items.filter((item) => item.itemType === "FOLDER").length;
+  const summary = loading ? "Loading…" : `${folderCount} folders · ${items.length - folderCount} files`;
+
+  function openItem(item: DriveItem) {
+    if (item.itemType === "FOLDER") {
+      void openFolderId(item.driveItemId);
+      return;
+    }
+    window.open(driveOpenUrl(item), "_blank", "noopener,noreferrer");
+  }
+
+  async function syncCurrent() {
+    setSyncing(true);
+    syncedRef.current.delete(currentId);
+    await openFolderId(currentId, true);
+    setSyncing(false);
+  }
 
   return (
-    <div className="flex flex-1 flex-col overflow-auto p-5">
-      <div className="mb-5">
-        <h2 className="text-lg font-semibold">Final</h2>
-        <p className="text-sm text-muted-foreground">Generated files in BAartworkShopify / baartwork / runs</p>
+    <div className={cn("grid min-h-0 flex-1", panelOpen ? "grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-[minmax(0,1fr)]")}>
+      <div className={cn("min-w-0", panelOpen && "border-r border-border")}>
+        <DriveToolbar
+          query={query}
+          setQuery={setQuery}
+          viewMode={viewMode}
+          setViewMode={setViewMode}
+          syncing={syncing}
+          onSync={() => void syncCurrent()}
+          breadcrumbs={breadcrumbs}
+          summary={summary}
+          onBreadcrumbSelect={(index) => {
+            const crumb = breadcrumbs[index];
+            if (crumb?.driveItemId) void openFolderId(crumb.driveItemId);
+          }}
+          onRefresh={() => void openFolderId(currentId)}
+          previewPanelOpen={panelOpen}
+          onTogglePreviewPanel={() => setPanelOpen((open) => !open)}
+        />
+        <div className="grid min-h-[calc(100vh-72px)] grid-cols-[260px_minmax(0,1fr)]">
+          <FolderTree
+            rootChildren={folderChildren[FINAL_ROOT_FOLDER_ID] ?? []}
+            folderChildren={folderChildren}
+            expanded={expanded}
+            currentKey={currentId === FINAL_ROOT_FOLDER_ID ? "root" : currentId}
+            loadingKeys={loadingKeys}
+            onNavigate={(key) => void openFolderId(key === "root" ? FINAL_ROOT_FOLDER_ID : key)}
+            onToggle={(key) => void toggleTreeFolder(key === "root" ? FINAL_ROOT_FOLDER_ID : key)}
+          />
+          <DriveContent
+            items={visibleItems}
+            selectedItem={null}
+            previewItem={previewItem}
+            onSelect={() => undefined}
+            onPreview={(item) => {
+              setPreviewItem(item);
+              setPanelOpen(true);
+            }}
+            onOpen={openItem}
+            viewMode={viewMode}
+            loading={loading}
+            error={error}
+            query={query}
+            isRootFolder={currentId === FINAL_ROOT_FOLDER_ID}
+            onBack={() => {
+              const parent = meta[currentId]?.parentId;
+              if (parent) void openFolderId(parent);
+            }}
+            onSync={() => void syncCurrent()}
+          />
+        </div>
       </div>
-
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-medium">Date</span>
-          <div className="flex rounded-md border border-border bg-background p-0.5">
-            {filterOptions.map((filter) => (
-              <button
-                key={filter.id}
-                className={cn(
-                  "rounded-md px-3 py-1.5 text-sm transition-colors",
-                  dateFilter === filter.id
-                    ? "bg-primary text-primary-foreground"
-                    : "text-muted-foreground hover:bg-secondary",
-                )}
-                onClick={() => setDateFilter(filter.id)}
-              >
-                {filter.label}
-              </button>
-            ))}
-          </div>
-          {dateFilter === "custom" ? (
-            <div className="flex items-center gap-2">
-              <Input
-                className="w-[150px]"
-                type="date"
-                value={customFromDate}
-                onChange={(event) => setCustomFromDate(event.target.value)}
-              />
-              <span className="text-xs text-muted-foreground">to</span>
-              <Input
-                className="w-[150px]"
-                type="date"
-                value={customToDate}
-                onChange={(event) => setCustomToDate(event.target.value)}
-              />
-            </div>
-          ) : null}
-        </div>
-        <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
-          {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-          Refresh
-        </Button>
-      </div>
-
-      {error ? (
-        <div className="flex items-center justify-center p-10">
-          <div className="max-w-md rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-            <CircleAlert className="mb-2 h-4 w-4" />
-            {error}
-          </div>
-        </div>
-      ) : null}
-
-      {loading ? (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-4">
-          {Array.from({ length: 8 }).map((_, index) => (
-            <div key={index} className="h-[200px] animate-pulse rounded-md border border-border bg-card">
-              <div className="h-28 bg-muted" />
-              <div className="space-y-2 p-3">
-                <div className="h-4 rounded-sm bg-muted" />
-                <div className="h-4 w-2/3 rounded-sm bg-muted" />
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : null}
-
-      {!loading && !error && files.length === 0 ? (
-        <div className="flex items-center justify-center p-10">
-          <div className="max-w-md rounded-md border border-dashed border-border p-6 text-center">
-            <ImageIcon className="mx-auto mb-3 h-8 w-8 text-muted-foreground" />
-            <div className="font-medium">No generated files yet</div>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Run media generation workflows to create output files in Supabase Storage.
-            </p>
-          </div>
-        </div>
-      ) : null}
-
-      {!loading && !error && files.length > 0 ? (
-        <div className="overflow-hidden rounded-md border border-border bg-card">
-          <div className="grid grid-cols-[82px_minmax(180px,1.4fr)_minmax(180px,1fr)_140px_120px_96px] border-b border-border bg-secondary/60 px-3 py-2 text-xs font-medium uppercase text-muted-foreground">
-            <span>Preview</span>
-            <span>Name</span>
-            <span>Run</span>
-            <span>Updated</span>
-            <span>Size</span>
-            <span>Action</span>
-          </div>
-          {files.map((file) => (
-            <FinalFileRow
-              key={file.path}
-              file={file}
-              onOpen={() => {
-                if (file.signed_url) {
-                  window.open(file.signed_url, "_blank", "noopener,noreferrer");
-                }
-              }}
-            />
-          ))}
-        </div>
+      {panelOpen ? (
+        <FinalPreviewPanel
+          item={previewItem}
+          onClose={() => setPanelOpen(false)}
+          onOpenFolder={(folder) => void openFolderId(folder.driveItemId)}
+        />
       ) : null}
     </div>
   );
 }
 
-// Drive "view" links are HTML pages, not images — map them to Drive's thumbnail endpoint.
-function thumbnailSrc(url: string): string {
-  const driveId = url.match(/drive\.google\.com\/file\/d\/([^/?#]+)/)?.[1]
-    ?? (url.includes("drive.google.com") ? new URL(url).searchParams.get("id") : null);
-  return driveId ? `https://drive.google.com/thumbnail?id=${driveId}&sz=w200` : url;
-}
-
-function FinalFileRow({ file, onOpen }: { file: FinalFile; onOpen: () => void }) {
-  const isImage = file.mime_type?.startsWith("image/");
-  const isVideo = file.mime_type?.startsWith("video/");
-  const [thumbFailed, setThumbFailed] = useState(false);
-
-  return (
-    <div className="grid grid-cols-[82px_minmax(180px,1.4fr)_minmax(180px,1fr)_140px_120px_96px] items-center border-b border-border px-3 py-2.5 last:border-b-0">
-      <button className="relative block h-14 w-14 overflow-hidden rounded-md bg-secondary" onClick={onOpen}>
-        {isImage && file.signed_url && !thumbFailed ? (
-          // Plain <img>: sources span Supabase signed URLs and Drive, not all whitelisted for next/image.
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={thumbnailSrc(file.signed_url)}
-            alt=""
-            loading="lazy"
-            referrerPolicy="no-referrer"
-            className="h-full w-full object-cover"
-            onError={() => setThumbFailed(true)}
-          />
-        ) : (
-          <div className="flex h-full items-center justify-center">
-            {isVideo ? <Film className="h-5 w-5 text-muted-foreground" /> : <ImageIcon className="h-5 w-5 text-muted-foreground" />}
-          </div>
-        )}
-      </button>
-      <div className="min-w-0 pr-3">
-        <button className="block truncate text-left text-sm font-medium hover:text-primary" onClick={onOpen} title={file.name}>
-          {file.name}
-        </button>
-        <div className="mt-1 truncate font-mono text-xs text-muted-foreground" title={file.path}>
-          {file.path}
-        </div>
-      </div>
-      <div className="min-w-0 pr-3">
-        <div className="truncate font-mono text-xs" title={file.run_id}>
-          {file.run_id}
-        </div>
-      </div>
-      <span className="text-xs text-muted-foreground">{formatDate(file.updated_at)}</span>
-      <span className="text-xs text-muted-foreground">{formatBytes(file.size_bytes)}</span>
-      <Button variant="outline" size="sm" onClick={onOpen} disabled={!file.signed_url}>
-        <Download className="h-4 w-4" />
-        Open
+function FinalPreviewPanel({
+  item,
+  onClose,
+  onOpenFolder,
+}: {
+  item: DriveItem | null;
+  onClose: () => void;
+  onOpenFolder: (folder: DriveItem) => void;
+}) {
+  const header = (
+    <div className="mb-4 flex items-center justify-between">
+      <h3 className="text-sm font-semibold">{item ? (item.itemType === "FOLDER" ? "Folder" : "File Preview") : "Preview"}</h3>
+      <Button variant="ghost" size="icon" title="Hide details panel" aria-label="Hide details panel" onClick={onClose}>
+        <X className="h-4 w-4" />
       </Button>
     </div>
+  );
+
+  if (!item) {
+    return (
+      <aside className="bg-card p-5">
+        {header}
+        <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
+          Select a file to preview. Double-click to open it in Google Drive.
+        </div>
+      </aside>
+    );
+  }
+
+  const isFolder = item.itemType === "FOLDER";
+  const isImage = item.itemType === "IMAGE";
+  const isVideo = item.itemType === "VIDEO";
+  const previewId = encodeURIComponent(item.driveItemId);
+
+  return (
+    <aside className="overflow-auto bg-card p-5">
+      {header}
+      <div className="mb-4 overflow-hidden rounded-tile border border-border bg-brand-cream/50">
+        {isImage ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={`https://drive.google.com/thumbnail?id=${previewId}&sz=w1000`}
+            alt={item.name}
+            referrerPolicy="no-referrer"
+            className="max-h-[420px] w-full object-contain"
+          />
+        ) : isVideo ? (
+          <iframe
+            src={`https://drive.google.com/file/d/${previewId}/preview`}
+            title={item.name}
+            allow="autoplay"
+            className="aspect-video w-full"
+          />
+        ) : (
+          <div className="flex aspect-video items-center justify-center">
+            {isFolder ? <FolderGlyph className="h-16" /> : <File className="h-12 w-12 text-muted-foreground" />}
+          </div>
+        )}
+      </div>
+      <div className="mb-4 break-words text-sm font-medium">{item.name}</div>
+      <dl className="mb-5 grid grid-cols-2 gap-3 text-sm">
+        <div className="rounded-md border border-border p-3">
+          <dt className="text-xs text-muted-foreground">Modified</dt>
+          <dd>{formatDate(item.modifiedTime)}</dd>
+        </div>
+        <div className="rounded-md border border-border p-3">
+          <dt className="text-xs text-muted-foreground">{isFolder ? "Type" : "Size"}</dt>
+          <dd>{isFolder ? "Folder" : formatBytes(item.sizeBytes)}</dd>
+        </div>
+      </dl>
+      <div className="space-y-2">
+        {isFolder ? (
+          <Button className="w-full" onClick={() => onOpenFolder(item)}>
+            <FolderOpen className="mr-2 h-4 w-4" />
+            Open folder
+          </Button>
+        ) : (
+          <Button className="w-full" onClick={() => window.open(driveDownloadUrl(item), "_blank", "noopener,noreferrer")}>
+            <Download className="mr-2 h-4 w-4" />
+            Download
+          </Button>
+        )}
+        <Button
+          variant="outline"
+          className="w-full"
+          onClick={() => window.open(driveOpenUrl(item), "_blank", "noopener,noreferrer")}
+        >
+          <Share2 className="mr-2 h-4 w-4" />
+          Open in Google Drive
+        </Button>
+      </div>
+    </aside>
   );
 }
 

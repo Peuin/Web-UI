@@ -197,6 +197,13 @@ export const platformApi = {
   listJobs(accessToken: string) {
     return callEdgeFunction<{ jobs: ApiWorkflowJob[] }>("workflow-jobs", accessToken);
   },
+  retryJob(accessToken: string, runId: string) {
+    return callEdgeFunction<{ status: string; retry_of_run_id: string; n8n_response?: unknown }>(
+      "workflow-jobs",
+      accessToken,
+      { method: "POST", body: JSON.stringify({ action: "retry", run_id: runId }) },
+    );
+  },
   getWorkflowDetail(accessToken: string, jobId: string) {
     return callEdgeFunction<ApiWorkflowJob>(`workflow-detail?job_id=${encodeURIComponent(jobId)}`, accessToken);
   },
@@ -320,5 +327,31 @@ export function normalizeWorkflowJob(job: ApiWorkflowJob): WorkflowJob {
     startedAt: job.started_at,
     completedAt: job.completed_at,
     errorMessage: job.error_message ?? undefined,
+    rawStatus: job.raw_status,
+    productType: job.product_type ?? null,
+    sourceName: job.source_name ?? null,
+    selectedName: job.selected_name ?? null,
+    selectedType: job.selected_type ?? null,
+    canRetry: job.can_retry ?? false,
+    folders: (job.folders ?? []).map((folder) => ({
+      runId: folder.run_id,
+      parentRunId: folder.parent_run_id,
+      depth: folder.depth,
+      name: folder.name,
+      sourcePath: folder.source_path,
+      driveFolderId: folder.drive_folder_id,
+      status: folder.status,
+      rawStatus: folder.raw_status,
+      imageCount: folder.image_count,
+      childFolderCount: folder.child_folder_count,
+      files: folder.files ?? [],
+      attempt: folder.attempt,
+      retryAction: folder.retry_action,
+      canRetry: folder.can_retry,
+      errorMessage: folder.error_message ?? undefined,
+      startedAt: folder.started_at,
+      finishedAt: folder.finished_at,
+      updatedAt: folder.updated_at,
+    })),
   };
 }

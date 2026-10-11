@@ -61,10 +61,33 @@ export type WorkflowStatus =
   | "FAILED"
   | "CANCELLED";
 
+/** One Drive folder inside a batch's scan tree (n8n_run kind = 'folder'). */
+export type JobFolderRun = {
+  runId: string;
+  parentRunId: string | null;
+  depth: number;
+  name: string;
+  sourcePath: string | null;
+  driveFolderId: string;
+  status: WorkflowStatus;
+  rawStatus: string;
+  imageCount: number | null;
+  childFolderCount: number | null;
+  files: { id: string; name: string | null }[];
+  attempt: number | null;
+  retryAction: string | null;
+  canRetry: boolean;
+  errorMessage?: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  updatedAt: string | null;
+};
+
 export type WorkflowJob = {
   id: string;
   workflowType: string;
   status: WorkflowStatus;
+  rawStatus?: string;
   progress: number;
   inputFiles: number;
   createdBy: string;
@@ -72,6 +95,33 @@ export type WorkflowJob = {
   startedAt: string | null;
   completedAt: string | null;
   errorMessage?: string;
+  productType?: string | null;
+  sourceName?: string | null;
+  selectedName?: string | null;
+  selectedType?: string | null;
+  canRetry?: boolean;
+  folders: JobFolderRun[];
+};
+
+export type ApiJobFolderRun = {
+  run_id: string;
+  parent_run_id: string | null;
+  depth: number;
+  name: string;
+  source_path: string | null;
+  drive_folder_id: string;
+  status: WorkflowStatus;
+  raw_status: string;
+  image_count: number | null;
+  child_folder_count: number | null;
+  files?: { id: string; name: string | null }[];
+  attempt: number | null;
+  retry_action: string | null;
+  can_retry: boolean;
+  error_message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string | null;
 };
 
 export type ApiWorkflowJob = {
@@ -89,6 +139,13 @@ export type ApiWorkflowJob = {
   completed_at: string | null;
   updated_at: string | null;
   workflow_job_files?: { id: string }[];
+  raw_status?: string;
+  product_type?: string | null;
+  source_name?: string | null;
+  selected_name?: string | null;
+  selected_type?: string | null;
+  can_retry?: boolean;
+  folders?: ApiJobFolderRun[];
 };
 
 // ─── Supabase Storage (Model tab) ─────────────────────────────────────────────
