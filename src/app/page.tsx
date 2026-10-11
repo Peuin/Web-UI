@@ -219,7 +219,7 @@ export default function Home() {
   // Generation form state
   const [productType, setProductType] = useState("cape");
   const [productDescription, setProductDescription] = useState("");
-  const [productAttributes, setProductAttributes] = useState("");
+  const [sample_prompt, setSamplePrompt] = useState("");
   const [sourceStoragePrefix, setSourceStoragePrefix] = useState("google-drive/01_New_Product_Raw/ARTIC WIDE LAPEL");
   const [modelReferenceUrl, setModelReferenceUrl] = useState("");
   const [imageCount, setImageCount] = useState("4");
@@ -977,7 +977,7 @@ export default function Home() {
       parameters_keys: Object.keys({
         product_type: productType,
         product_description: productDescription,
-        product_attributes: productAttributes,
+        sample_prompt: sample_prompt,
         source_storage_prefix: sourceStoragePrefix,
         model_reference_url: sanitizedModelReferenceUrl,
         image_count: parseInt(imageCount, 10),
@@ -1012,7 +1012,7 @@ export default function Home() {
       parameters: {
         product_type: productType,
         product_description: productDescription,
-        product_attributes: productAttributes,
+        sample_prompt: sample_prompt,
         source_storage_prefix: sourceStoragePrefix,
         model_reference_url: sanitizedModelReferenceUrl ?? "",
         image_count: parseInt(imageCount, 10),
@@ -1120,8 +1120,8 @@ export default function Home() {
                 setProductType={setProductType}
                 productDescription={productDescription}
                 setProductDescription={setProductDescription}
-                productAttributes={productAttributes}
-                setProductAttributes={setProductAttributes}
+                sample_prompt={sample_prompt}
+                setSamplePrompt={setSamplePrompt}
                 sourceStoragePrefix={sourceStoragePrefix}
                 setSourceStoragePrefix={setSourceStoragePrefix}
                 modelReferenceUrl={modelReferenceUrl}
@@ -2523,6 +2523,17 @@ function DriveContent({
   );
 }
 
+// Drive thumbnails are already resized and may require the browser's Google session.
+// Next's server-side image optimizer does not forward that session.
+function isGoogleThumbnail(src: string): boolean {
+  try {
+    const { hostname } = new URL(src);
+    return hostname === "googleusercontent.com" || hostname.endsWith(".googleusercontent.com");
+  } catch {
+    return false;
+  }
+}
+
 function MediaCard({
   item,
   selected,
@@ -2571,7 +2582,7 @@ function MediaCard({
         {isFolder ? (
           <FolderGlyph className="h-16 transition-transform duration-300 group-hover:scale-110" />
         ) : item.thumbnailUrl ? (
-          <Image src={item.thumbnailUrl} alt="" fill sizes="260px" className="object-cover" />
+          <Image src={item.thumbnailUrl} alt="" fill sizes="260px" className="object-cover" unoptimized={isGoogleThumbnail(item.thumbnailUrl)} referrerPolicy="no-referrer" />
         ) : (
           <Icon className="h-10 w-10 text-muted-foreground" />
         )}
@@ -2674,8 +2685,8 @@ function PreviewDrawer({
   setProductType,
   productDescription,
   setProductDescription,
-  productAttributes,
-  setProductAttributes,
+  sample_prompt,
+  setSamplePrompt,
   sourceStoragePrefix,
   setSourceStoragePrefix,
   modelReferenceUrl,
@@ -2699,8 +2710,8 @@ function PreviewDrawer({
   setProductType: (value: string) => void;
   productDescription: string;
   setProductDescription: (value: string) => void;
-  productAttributes: string;
-  setProductAttributes: (value: string) => void;
+  sample_prompt: string;
+  setSamplePrompt: (value: string) => void;
   sourceStoragePrefix: string;
   setSourceStoragePrefix: (value: string) => void;
   modelReferenceUrl: string;
@@ -2787,11 +2798,11 @@ function PreviewDrawer({
             </div>
 
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">Product Attributes</label>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">Input Sample Prompt</label>
               <Textarea
-                placeholder="Optional product attributes..."
-                value={productAttributes}
-                onChange={(e) => setProductAttributes(e.target.value)}
+                placeholder="Optional sample prompt..."
+                value={sample_prompt}
+                onChange={(e) => setSamplePrompt(e.target.value)}
                 rows={2}
               />
             </div>
@@ -2909,7 +2920,7 @@ function PreviewDrawer({
               </div>
               <div className="relative mb-4 aspect-video overflow-hidden rounded-md bg-secondary">
                 {displayItem.thumbnailUrl ? (
-                  <Image src={displayItem.thumbnailUrl} alt="" fill sizes="360px" className="object-cover" />
+                  <Image src={displayItem.thumbnailUrl} alt="" fill sizes="360px" className="object-cover" unoptimized={isGoogleThumbnail(displayItem.thumbnailUrl)} referrerPolicy="no-referrer" />
                 ) : (
                   <div className="flex h-full items-center justify-center">
                     <File className="h-10 w-10 text-muted-foreground" />
