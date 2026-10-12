@@ -24,6 +24,7 @@ import {
   List,
   Loader2,
   LogOut,
+  Menu,
   MoreHorizontal,
   PanelRightClose,
   PanelRightOpen,
@@ -186,9 +187,16 @@ function getFolderKey(folderDriveId: string | null = null, storagePath: string |
 }
 
 /** Single click previews, double click (or Enter) opens. */
-function previewOpenHandlers(onPreview: () => void, onOpen: () => void) {
+// Touch screens have no double-click: a tap on a folder opens it instead of previewing.
+function isTouchOnly() {
+  return typeof window !== "undefined" && window.matchMedia("(hover: none)").matches;
+}
+
+const NARROW_SCREEN_QUERY = "(max-width: 1279px)";
+
+function previewOpenHandlers(onPreview: () => void, onOpen: () => void, isFolder = false) {
   return {
-    onClick: onPreview,
+    onClick: () => (isFolder && isTouchOnly() ? onOpen() : onPreview()),
     onDoubleClick: onOpen,
     onKeyDown: (event: React.KeyboardEvent) => {
       if (event.key === "Enter") {
@@ -245,6 +253,7 @@ export default function Home() {
   // Generation form state
   const syncedFolderIdsRef = useRef(new Set<string>());
   const [previewPanelOpen, setPreviewPanelOpen] = useState(true);
+  const [navOpen, setNavOpen] = useState(false);
   const [productType, setProductType] = useState("cape");
   const [productTypeOptions, setProductTypeOptions] = useState<ProductTypeOption[]>(DEFAULT_PRODUCT_TYPE_OPTIONS);
   const [productDescription, setProductDescription] = useState("");
@@ -493,7 +502,10 @@ export default function Home() {
 
   useEffect(() => {
     try {
-      if (localStorage.getItem(PREVIEW_PANEL_STORAGE_KEY) === "closed") {
+      if (
+        window.matchMedia(NARROW_SCREEN_QUERY).matches ||
+        localStorage.getItem(PREVIEW_PANEL_STORAGE_KEY) === "closed"
+      ) {
         queueMicrotask(() => setPreviewPanelOpen(false));
       }
     } catch {
@@ -696,7 +708,8 @@ export default function Home() {
     if (!supabase) return;
 
     setSigningOut(true);
-    await supabase.auth.signOut();
+    // Default scope is "global", which revokes this user's sessions on every device.
+    await supabase.auth.signOut({ scope: "local" });
     setSigningOut(false);
 
     // Clear the previous user's workspace so the next sign-in starts clean.
@@ -981,16 +994,22 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-background text-foreground">
-      <div className="grid min-h-screen grid-cols-[260px_minmax(0,1fr)]">
+      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[260px_minmax(0,1fr)]">
         <AppSidebar
+          open={navOpen}
+          onClose={() => setNavOpen(false)}
           activeTab={activeTab}
-          onTabChange={switchTab}
+          onTabChange={(tab) => {
+            setNavOpen(false);
+            switchTab(tab);
+          }}
           userEmail={userEmail}
           signingOut={signingOut}
           onSignOut={() => void signOut()}
         />
         <section className="flex min-w-0 flex-col">
           <TopBar
+            onOpenNav={() => setNavOpen(true)}
             modelLibrary={activeTab === "model"}
             selectedItem={selectedItem}
           />
@@ -1003,7 +1022,7 @@ export default function Home() {
                 previewPanelOpen ? "grid-cols-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-[minmax(0,1fr)]",
               )}
             >
-              <div className={cn("min-w-0", previewPanelOpen && "border-r border-border")}>
+              <div className={cn("min-w-0", previewPanelOpen && "xl:border-r xl:border-border")}>
                 <DriveToolbar
                   previewPanelOpen={previewPanelOpen}
                   onTogglePreviewPanel={() => setPreviewPanelOpen((open) => !open)}
@@ -1033,7 +1052,7 @@ export default function Home() {
                         ))
                       : undefined}
                 />
-                <div className="grid min-h-[calc(100vh-137px)] grid-cols-[240px_minmax(0,1fr)]">
+                <div className="grid min-h-[calc(100vh-137px)] grid-cols-1 lg:grid-cols-[240px_minmax(0,1fr)]">
                   <FolderTree
                     rootChildren={folderChildren.root ?? folders}
                     folderChildren={folderChildren}
@@ -1061,6 +1080,7 @@ export default function Home() {
                 </div>
               </div>
               {previewPanelOpen ? (
+              <SidePanel onClose={() => setPreviewPanelOpen(false)}>
               <PreviewDrawer
                 onClose={() => setPreviewPanelOpen(false)}
                 item={previewItem}
@@ -1094,6 +1114,7 @@ export default function Home() {
                 onSubmit={submitWorkflow}
                 onOpenFolder={openFolder}
               />
+              </SidePanel>
               ) : null}
             </div>
           ) : null}
@@ -1141,12 +1162,16 @@ export default function Home() {
 }
 
 function AppSidebar({
+  open,
+  onClose,
   activeTab,
   onTabChange,
   userEmail,
   signingOut,
   onSignOut,
 }: {
+  open: boolean;
+  onClose: () => void;
   activeTab: WorkspaceTab;
   onTabChange: (tab: WorkspaceTab) => void;
   userEmail: string | null;
@@ -1162,7 +1187,15 @@ function AppSidebar({
   const userLabel = userEmail ?? "Signed in";
 
   return (
-    <aside className="sticky top-0 flex h-screen flex-col border-r border-border bg-brand-cream">
+    <>
+    {open ? <div className="fixed inset-0 z-40 bg-black/30 lg:hidden" aria-hidden="true" onClick={onClose} /> : null}
+    {/* Off-canvas drawer below lg; fixed column on desktop. */}
+    <aside
+      className={cn(
+        "fixed inset-y-0 left-0 z-50 flex h-screen w-[260px] flex-col border-r border-border bg-brand-cream transition-transform lg:sticky lg:top-0 lg:z-auto lg:translate-x-0",
+        open ? "translate-x-0" : "-translate-x-full",
+      )}
+    >
       <div className="flex h-16 items-center gap-3 border-b border-border px-5">
         <Image
           src="/brand/baartwork-logo.png"
@@ -1222,19 +1255,37 @@ function AppSidebar({
         </Button>
       </div>
     </aside>
+    </>
+  );
+}
+
+/** Right-hand panel: a grid column on xl+, a slide-over sheet with backdrop below xl. */
+function SidePanel({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+  return (
+    <>
+      <div className="fixed inset-0 z-30 bg-black/30 xl:hidden" aria-hidden="true" onClick={onClose} />
+      <div className="fixed inset-y-0 right-0 z-40 w-full max-w-md overflow-y-auto bg-card shadow-xl xl:static xl:z-auto xl:max-w-none xl:overflow-visible xl:shadow-none">
+        {children}
+      </div>
+    </>
   );
 }
 
 function TopBar({
+  onOpenNav,
   modelLibrary = false,
   selectedItem,
 }: {
+  onOpenNav: () => void;
   modelLibrary?: boolean;
   selectedItem: DriveItem | null;
 }) {
   return (
-    <header className="flex min-h-16 min-w-0 flex-wrap items-center justify-between gap-3 border-b border-border bg-card px-5 py-3">
-      <div className="min-w-0 flex-1 basis-60">
+    <header className="flex min-h-16 min-w-0 items-center justify-between gap-3 border-b border-border bg-card px-4 py-3 md:px-5">
+      <Button variant="ghost" size="icon" className="shrink-0 lg:hidden" aria-label="Open menu" onClick={onOpenNav}>
+        <Menu className="h-5 w-5" />
+      </Button>
+      <div className="min-w-0 flex-1">
         <h2 className="text-base font-semibold">{modelLibrary ? "Model Library" : "Creative source media"}</h2>
         <p className="truncate text-xs text-muted-foreground" title={selectedItem?.name}>
           {modelLibrary ? "Manage reference images for your media" : selectedItem ? `${selectedItem.itemType === 'FOLDER' ? 'Folder' : 'File'} selected: ${selectedItem.name}` : 'Select a file or folder to generate media'}
@@ -1248,7 +1299,7 @@ function TopBar({
           onClick={() => window.open("/user-guide.html", "_blank", "noopener,noreferrer")}
         >
           <BookOpen className="h-4 w-4" />
-          User Guide
+          <span className="hidden sm:inline">User Guide</span>
         </Button>
       </div>
     </header>
@@ -1834,7 +1885,7 @@ function FolderTree({
   }
 
   return (
-    <aside className="overflow-auto border-r border-border bg-brand-cream/50 px-3 py-4">
+    <aside className="hidden overflow-auto border-r border-border bg-brand-cream/50 px-3 py-4 lg:block">
       <div className="mb-2 px-2 font-montserrat text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
         Folders
       </div>
@@ -2066,7 +2117,7 @@ function MediaCard({
       <button
         className="relative flex aspect-[4/3] select-none items-center justify-center overflow-hidden rounded-tile border border-border bg-card"
         title={isFolder ? "Double-click to open" : "Double-click to preview"}
-        {...previewOpenHandlers(onPreview, onOpen)}
+        {...previewOpenHandlers(onPreview, onOpen, isFolder)}
       >
         {/* Drive's folder thumbnails are blurry generic icons — always use our glyph. */}
         {isFolder ? (
@@ -2095,7 +2146,7 @@ function MediaCard({
         {selected ? <Check className="h-3.5 w-3.5" /> : null}
       </button>
       <div className="flex flex-1 flex-col">
-        <button className="mt-3 line-clamp-1 select-none text-center text-sm font-medium hover:text-brand-dark" title={item.name} {...previewOpenHandlers(onPreview, onOpen)}>
+        <button className="mt-3 line-clamp-1 select-none text-center text-sm font-medium hover:text-brand-dark" title={item.name} {...previewOpenHandlers(onPreview, onOpen, isFolder)}>
           {item.name}
         </button>
         <div className="relative mt-1 h-8">
@@ -2128,7 +2179,7 @@ function MediaRow(props: {
   const isFolder = props.item.itemType === "FOLDER";
 
   return (
-    <div className={cn("grid grid-cols-[40px_minmax(0,1fr)_130px_120px_120px_44px] items-center border-b border-border px-3 py-2.5 last:border-b-0", props.selected ? "bg-primary/5" : props.previewed && "bg-secondary")}>
+    <div className={cn("grid grid-cols-[40px_minmax(0,1fr)_44px] items-center md:grid-cols-[40px_minmax(0,1fr)_130px_120px_120px_44px] border-b border-border px-3 py-2.5 last:border-b-0", props.selected ? "bg-primary/5" : props.previewed && "bg-secondary")}>
       <button
         className={cn(
           "flex h-5 w-5 items-center justify-center rounded-sm border",
@@ -2145,7 +2196,7 @@ function MediaRow(props: {
       <button
         className="flex min-w-0 select-none items-center gap-3 text-left"
         title={isFolder ? "Double-click to open" : undefined}
-        {...previewOpenHandlers(props.onPreview, props.onOpen)}
+        {...previewOpenHandlers(props.onPreview, props.onOpen, isFolder)}
         style={{ paddingLeft: Math.min(props.item.treeDepth ?? 0, 8) * 14 }}
       >
         {isFolder ? <FolderGlyph className="h-4 shrink-0" /> : <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />}
@@ -2158,9 +2209,9 @@ function MediaRow(props: {
           ) : null}
         </span>
       </button>
-      <span className="text-xs text-muted-foreground">{props.item.itemType}</span>
-      <span className="text-xs text-muted-foreground">{formatBytes(props.item.sizeBytes)}</span>
-      <span className="text-xs text-muted-foreground">{formatDate(props.item.modifiedTime)}</span>
+      <span className="hidden text-xs text-muted-foreground md:block">{props.item.itemType}</span>
+      <span className="hidden text-xs text-muted-foreground md:block">{formatBytes(props.item.sizeBytes)}</span>
+      <span className="hidden text-xs text-muted-foreground md:block">{formatDate(props.item.modifiedTime)}</span>
       <Button variant="ghost" size="icon" title="Preview metadata" onClick={props.onPreview}>
         <MoreHorizontal className="h-4 w-4" />
       </Button>
@@ -2532,7 +2583,12 @@ function Info({ label, value }: { label: string; value: string }) {
 }
 
 const JOBS_POLL_INTERVAL_MS = 15_000;
-const JOB_GRID = "grid grid-cols-[minmax(0,1.8fr)_90px_140px_110px_130px_120px_88px] gap-3";
+// Columns: name | status | progress | folders | created | action.
+// Phones keep name/status/action; md adds progress + counts; xl adds created.
+const JOB_GRID =
+  "grid gap-3 grid-cols-[minmax(0,1fr)_116px_88px] md:grid-cols-[minmax(0,1fr)_140px_110px_110px_88px] xl:grid-cols-[minmax(0,1fr)_140px_110px_120px_120px_88px]";
+const JOB_MD_CELL = "hidden md:block";
+const JOB_XL_CELL = "hidden xl:block";
 
 const RETRY_SKIP_LABEL: Record<string, string> = {
   job_not_found: "not a SKU job",
@@ -2677,9 +2733,9 @@ function JobsPage({
     });
 
   return (
-    <div className="grid flex-1 grid-cols-[minmax(0,1fr)_420px]">
-      <section className="min-w-0 p-5">
-        <div className="mb-4 flex items-center justify-between">
+    <div className="grid flex-1 grid-cols-1 2xl:grid-cols-[minmax(0,1fr)_400px]">
+      <section className="min-w-0 p-4 md:p-5">
+        <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold">Workflow Jobs</h2>
             <p className="text-sm text-muted-foreground">
@@ -2707,11 +2763,10 @@ function JobsPage({
         <div className="overflow-hidden rounded-md border border-border bg-card">
           <div className={cn(JOB_GRID, "border-b border-border px-4 py-3 text-xs font-semibold uppercase text-muted-foreground")}>
             <span>Batch / folder</span>
-            <span>Product</span>
             <span>Status</span>
-            <span>Progress</span>
-            <span>Folders · images</span>
-            <span>Created</span>
+            <span className={JOB_MD_CELL}>Progress</span>
+            <span className={JOB_MD_CELL}>Folders · images</span>
+            <span className={JOB_XL_CELL}>Created</span>
             <span />
           </div>
           {loading && jobs.length === 0 ? (
@@ -2765,19 +2820,19 @@ function JobsPage({
                     <div className="min-w-0">
                       <div className="truncate text-sm font-medium" title={label}>{label}</div>
                       <div className="truncate font-mono text-[11px] text-muted-foreground">
+                        {job.productType ? <span className="font-sans capitalize">{job.productType} · </span> : null}
                         {job.id.slice(0, 8)}
                         {job.sourceName && job.sourceName !== label ? ` · in ${job.sourceName}` : ""}
                       </div>
                     </div>
                   </div>
-                  <span className="truncate text-sm capitalize">{job.productType ?? "—"}</span>
                   <WorkflowStatusBadge status={job.status} rawStatus={job.rawStatus} />
-                  <WorkflowProgress value={job.progress} status={job.status} rawStatus={job.rawStatus} />
-                  <span className="text-sm text-muted-foreground">
+                  <WorkflowProgress value={job.progress} status={job.status} rawStatus={job.rawStatus} className={JOB_MD_CELL} />
+                  <span className={cn("text-sm text-muted-foreground", JOB_MD_CELL)}>
                     {counts.done}/{counts.total}
                     {counts.failed ? <span className="ml-1 text-red-600">· {counts.failed} failed</span> : null}
                   </span>
-                  <span className="text-xs text-muted-foreground">{formatDate(job.createdAt)}</span>
+                  <span className={cn("text-xs text-muted-foreground", JOB_XL_CELL)}>{formatDate(job.createdAt)}</span>
                   <div className="flex justify-end">
                     {job.canRetry ? (
                       <RetryButton runId={job.id} label={label} retryingRunId={retryingRunId} onRetry={onRetry} size="icon" />
@@ -2794,7 +2849,7 @@ function JobsPage({
                           folder.status === "FAILED" && "bg-red-50/60",
                         )}
                       >
-                        <div className="flex min-w-0 items-center gap-2" style={{ paddingLeft: 24 + folder.depth * 18 }}>
+                        <div className="flex min-w-0 items-center gap-2" style={{ paddingLeft: 12 + folder.depth * 14 }}>
                           <FolderGlyph className="h-3.5 shrink-0" />
                           <div className="min-w-0">
                             <div className="truncate text-sm" title={folder.sourcePath ?? folder.name}>{folder.name}</div>
@@ -2805,18 +2860,16 @@ function JobsPage({
                             ) : null}
                           </div>
                         </div>
-                        <span />
                         <div className="flex flex-wrap items-center gap-1">
                           <WorkflowStatusBadge status={folder.status} rawStatus={folder.rawStatus} />
-                <RetryStatusBadge folder={folder} />
                           <RetryStatusBadge folder={folder} />
                         </div>
-                        <span />
-                        <span className="text-xs text-muted-foreground">
+                        <span className={JOB_MD_CELL} />
+                        <span className={cn("text-xs text-muted-foreground", JOB_MD_CELL)}>
                           {folder.imageCount !== null ? `${folder.imageCount} images` : "Not scanned"}
                           {folder.childFolderCount ? ` · ${folder.childFolderCount} sub` : ""}
                         </span>
-                        <span className="text-xs text-muted-foreground">{formatDate(folder.updatedAt ?? folder.startedAt)}</span>
+                        <span className={cn("text-xs text-muted-foreground", JOB_XL_CELL)}>{formatDate(folder.updatedAt ?? folder.startedAt)}</span>
                         <div className="flex justify-end">
                           {folder.canRetry ? (
                             <RetryButton
@@ -2852,7 +2905,7 @@ function JobDetail({
 }) {
   if (!job) {
     return (
-      <aside className="border-l border-border bg-card p-5">
+      <aside className="border-t border-border bg-card p-4 md:p-5 2xl:border-l 2xl:border-t-0">
         <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
           Select a batch to inspect its folders.
         </div>
@@ -2865,7 +2918,7 @@ function JobDetail({
   const label = jobLabel(job);
 
   return (
-    <aside className="overflow-auto border-l border-border bg-card p-5">
+    <aside className="overflow-auto border-t border-border bg-card p-4 md:p-5 2xl:border-l 2xl:border-t-0">
       <div className="mb-4 flex items-start justify-between gap-3">
         <div className="min-w-0">
           <WorkflowStatusBadge status={job.status} rawStatus={job.rawStatus} />
@@ -2920,6 +2973,7 @@ function JobDetail({
                   {folder.name}
                 </span>
                 <WorkflowStatusBadge status={folder.status} rawStatus={folder.rawStatus} />
+                <RetryStatusBadge folder={folder} />
                 {folder.canRetry ? (
                   <RetryButton
                     runId={folder.runId}
@@ -2985,6 +3039,10 @@ function FinalBrowser({ accessToken }: { accessToken: string }) {
   const [viewMode, setViewMode] = useState<ViewMode>("grid");
   const [previewItem, setPreviewItem] = useState<DriveItem | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
+  useEffect(() => {
+    // The panel overlays the grid on narrow screens; start with it closed there.
+    if (window.matchMedia(NARROW_SCREEN_QUERY).matches) queueMicrotask(() => setPanelOpen(false));
+  }, []);
   const [meta, setMeta] = useState<Record<string, FinalFolderMeta>>({
     [FINAL_ROOT_FOLDER_ID]: { name: FINAL_ROOT_FOLDER_NAME, parentId: null },
   });
@@ -3078,7 +3136,7 @@ function FinalBrowser({ accessToken }: { accessToken: string }) {
 
   return (
     <div className={cn("grid min-h-0 min-w-0 flex-1", panelOpen ? "grid-cols-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-[minmax(0,1fr)]")}>
-      <div className={cn("min-w-0", panelOpen && "border-r border-border")}>
+      <div className={cn("min-w-0", panelOpen && "xl:border-r xl:border-border")}>
         <DriveToolbar
           query={query}
           setQuery={setQuery}
@@ -3127,11 +3185,13 @@ function FinalBrowser({ accessToken }: { accessToken: string }) {
         </div>
       </div>
       {panelOpen ? (
+        <SidePanel onClose={() => setPanelOpen(false)}>
         <FinalPreviewPanel
           item={previewItem}
           onClose={() => setPanelOpen(false)}
           onOpenFolder={(folder) => void openFolderId(folder.driveItemId)}
         />
+        </SidePanel>
       ) : null}
     </div>
   );
@@ -3239,7 +3299,7 @@ function SettingsPage() {
         <h2 className="text-lg font-semibold">Integration Settings</h2>
         <p className="text-sm text-muted-foreground">Server-side credentials and webhook contracts</p>
       </div>
-      <div className="grid max-w-5xl grid-cols-2 gap-4">
+      <div className="grid max-w-5xl grid-cols-1 gap-4 md:grid-cols-2">
         <SettingPanel
           icon={Database}
           title="Supabase API Gateway"
