@@ -8,6 +8,8 @@ import type {
   FinalFilesResponse,
   WorkflowJob,
   ModelLibraryItem,
+  SkuRetryStatusResponse,
+  SkuRetrySubmitResponse,
 } from "@/types/domain";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -198,12 +200,20 @@ export const platformApi = {
   listJobs(accessToken: string) {
     return callEdgeFunction<{ jobs: ApiWorkflowJob[] }>("workflow-jobs", accessToken);
   },
-  retryJob(accessToken: string, runId: string) {
-    return callEdgeFunction<{ status: string; retry_of_run_id: string; n8n_response?: unknown }>(
-      "workflow-jobs",
-      accessToken,
-      { method: "POST", body: JSON.stringify({ action: "retry", run_id: runId }) },
-    );
+  /**
+   * SKU retry via Production_08. Create requestId with crypto.randomUUID() once per
+   * click and reuse it only when resending the same job_ids after a timeout/503.
+   */
+  retrySkuJobs(accessToken: string, requestId: string, jobIds: string[]) {
+    return callEdgeFunction<SkuRetrySubmitResponse>("workflow-jobs-retry", accessToken, {
+      method: "POST",
+      body: JSON.stringify({ request_id: requestId, job_ids: jobIds }),
+    });
+  },
+  /** Poll every 3–5 s until data.all_terminal. */
+  getSkuRetryStatus(accessToken: string, requestId: string, jobIds: string[]) {
+    const params = new URLSearchParams({ request_id: requestId, job_ids: jobIds.join(",") });
+    return callEdgeFunction<SkuRetryStatusResponse>(`workflow-jobs-retry?${params.toString()}`, accessToken);
   },
   getWorkflowDetail(accessToken: string, jobId: string) {
     return callEdgeFunction<ApiWorkflowJob>(`workflow-detail?job_id=${encodeURIComponent(jobId)}`, accessToken);
@@ -337,6 +347,21 @@ export const platformApi = {
   },
 };
 
+// Drive API thumbnailLink (lh3…/drive-storage/…) expires within hours, but sync stores it.
+// Build a stable Drive thumbnail URL from the file ID instead; the browser's Google session authorizes it.
+function stableThumbnailUrl(url: string | null | undefined, driveItemId: string): string | null {
+  if (!url) return null;
+  try {
+    const { hostname, pathname } = new URL(url);
+    if (hostname.endsWith(".googleusercontent.com") && pathname.startsWith("/drive-storage/")) {
+      return `https://drive.google.com/thumbnail?id=${encodeURIComponent(driveItemId)}&sz=w400`;
+    }
+  } catch {
+    return url;
+  }
+  return url;
+}
+
 export function normalizeDriveItem(item: ApiDriveItem): DriveItem {
   const driveItemId = item.drive_item_id ?? item.id;
 
@@ -349,7 +374,7 @@ export function normalizeDriveItem(item: ApiDriveItem): DriveItem {
     mimeType: item.mime_type ?? "application/octet-stream",
     itemType: item.item_type,
     sizeBytes: item.size_bytes,
-    thumbnailUrl: item.thumbnail_url,
+    thumbnailUrl: stableThumbnailUrl(item.thumbnail_url, driveItemId),
     webViewLink: item.web_view_link,
     modifiedTime: item.modified_time ?? item.updated_at ?? item.created_at ?? new Date().toISOString(),
     syncedAt: item.updated_at ?? item.created_at ?? new Date().toISOString(),
@@ -393,6 +418,11 @@ export function normalizeWorkflowJob(job: ApiWorkflowJob): WorkflowJob {
       files: folder.files ?? [],
       attempt: folder.attempt,
       retryAction: folder.retry_action,
+      retryCount: folder.retry_count ?? 0,
+      lastRetryStatus: folder.last_retry_status ?? null,
+      lastRetryAt: folder.last_retry_at ?? null,
+      lastRetryError: folder.last_retry_error ?? null,
+      retryMode: folder.retry_mode ?? null,
       canRetry: folder.can_retry,
       errorMessage: folder.error_message ?? undefined,
       startedAt: folder.started_at,

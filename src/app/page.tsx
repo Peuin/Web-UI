@@ -229,6 +229,8 @@ export default function Home() {
   const [previewItem, setPreviewItem] = useState<DriveItem | null>(null);
   const [activeJob, setActiveJob] = useState<WorkflowJob | null>(null);
   const [retryingRunId, setRetryingRunId] = useState<string | null>(null);
+  // Kept only when acceptance is unknown (503/network), so a resend reuses the same request_id.
+  const pendingRetryRef = useRef<{ key: string; requestId: string } | null>(null);
   const [jobsNotice, setJobsNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const [loadingDrive, setLoadingDrive] = useState(false);
   const [loadingJobs, setLoadingJobs] = useState(false);
@@ -789,7 +791,10 @@ export default function Home() {
   }
 
   // Poll while the Jobs tab is open and something is still running.
-  const hasActiveJobs = jobs.some((job) => job.status === "QUEUED" || job.status === "PROCESSING");
+  const hasActiveJobs = jobs.some((job) =>
+    job.status === "QUEUED" || job.status === "PROCESSING" ||
+    job.folders.some((folder) => folder.lastRetryStatus === "queued" || folder.lastRetryStatus === "processing")
+  );
   useEffect(() => {
     if (activeTab !== "jobs" || !accessToken) return;
     if (!hasActiveJobs) return;
@@ -799,22 +804,55 @@ export default function Home() {
 
   async function retryRun(runId: string, label: string) {
     if (!accessToken || retryingRunId) return;
+    // Batch-level Retry = Retry All failed SKU folders in that batch.
+    const batch = jobs.find((job) => job.id === runId);
+    const jobIds = batch
+      ? batch.folders.filter((folder) => folder.canRetry).map((folder) => folder.runId)
+      : [runId];
+    if (jobIds.length === 0) {
+      setJobsNotice({ tone: "error", text: "No failed SKU folders to retry in this batch." });
+      return;
+    }
     const confirmed = window.confirm(
-      `Retry "${label}"?\n\nThis starts a new batch with the original settings and generates the images/video again (uses AI credits). Only confirm if you are sure the previous run failed.`,
+      `Retry "${label}"${jobIds.length > 1 ? ` (${jobIds.length} SKUs)` : ""}?\n\nThe server checks existing output first: complete output is only finalized; missing media is regenerated with the original settings (uses AI credits).`,
     );
     if (!confirmed) return;
 
+    const key = [...jobIds].sort().join(",");
+    const requestId = pendingRetryRef.current?.key === key
+      ? pendingRetryRef.current.requestId
+      : crypto.randomUUID();
+    pendingRetryRef.current = { key, requestId };
+
     setRetryingRunId(runId);
     setJobsNotice(null);
-    const response = await platformApi.retryJob(accessToken, runId);
+    const response = await platformApi.retrySkuJobs(accessToken, requestId, jobIds);
     setRetryingRunId(null);
-    if (!response.success) {
-      setJobsNotice({ tone: "error", text: response.error?.message ?? "Could not retry this run." });
+    if (!response.success || !response.data) {
+      const code = response.error?.code;
+      const unknownOutcome = code === "RETRY_QUEUE_UNAVAILABLE" || code === "NETWORK_ERROR" || code?.startsWith("HTTP_5");
+      if (!unknownOutcome) pendingRetryRef.current = null;
+      setJobsNotice({
+        tone: "error",
+        text: unknownOutcome
+          ? "Retry was not confirmed. Check the job status, then press Retry again to resend the same request."
+          : response.error?.message ?? "Could not retry this run.",
+      });
       return;
     }
+    pendingRetryRef.current = null;
+
+    const { accepted, skipped } = response.data;
+    const nameById = new Map(jobs.flatMap((job) => job.folders.map((folder) => [folder.runId, folder.name] as const)));
+    const skippedText = skipped
+      .map((item) => `${nameById.get(item.job_id) ?? item.job_id}: ${RETRY_SKIP_LABEL[item.reason] ?? item.reason}`)
+      .join("; ");
     setJobsNotice({
-      tone: "success",
-      text: `Retry sent for "${label}". The new batch will appear in the list in a few seconds.`,
+      tone: accepted.length > 0 ? "success" : "error",
+      text: [
+        accepted.length > 0 ? `Retry queued for ${accepted.length} SKU${accepted.length > 1 ? "s" : ""}.` : "No SKU was queued.",
+        skippedText ? `Skipped — ${skippedText}.` : "",
+      ].filter(Boolean).join(" "),
     });
     void loadJobs(accessToken);
   }
@@ -1979,7 +2017,8 @@ function DriveContent({
 function isGoogleThumbnail(src: string): boolean {
   try {
     const { hostname } = new URL(src);
-    return hostname === "googleusercontent.com" || hostname.endsWith(".googleusercontent.com");
+    return hostname === "drive.google.com" || hostname === "googleusercontent.com" ||
+      hostname.endsWith(".googleusercontent.com");
   } catch {
     return false;
   }
@@ -2495,6 +2534,17 @@ function Info({ label, value }: { label: string; value: string }) {
 const JOBS_POLL_INTERVAL_MS = 15_000;
 const JOB_GRID = "grid grid-cols-[minmax(0,1.8fr)_90px_140px_110px_130px_120px_88px] gap-3";
 
+const RETRY_SKIP_LABEL: Record<string, string> = {
+  job_not_found: "not a SKU job",
+  duplicate_request: "already sent",
+  job_not_retryable: "not retryable",
+  retry_already_active: "retry already running",
+  folder_busy: "folder is busy",
+  original_name_missing: "original folder name missing, needs review",
+  branch_review_required: "needs review",
+  batch_snapshot_missing: "original settings missing",
+};
+
 const RETRY_ACTION_LABEL: Record<string, string> = {
   recovery_existing_assets: "Can recover from saved outputs",
   resume_anchor_checkpoint: "Can resume from checkpoint",
@@ -2536,6 +2586,34 @@ function folderCounts(job: WorkflowJob) {
   const done = job.folders.filter((folder) => folder.rawStatus === "completed").length;
   const failed = job.folders.filter((folder) => folder.status === "FAILED").length;
   return { done, failed, total: job.folders.length };
+}
+
+const RETRY_STATUS_STYLE: Record<NonNullable<JobFolderRun["lastRetryStatus"]>, { label: string; className: string }> = {
+  queued: { label: "Queued", className: "border-amber-200 bg-amber-50 text-amber-800" },
+  processing: { label: "Processing", className: "border-blue-200 bg-blue-50 text-blue-800" },
+  completed: { label: "Succeeded", className: "border-emerald-200 bg-emerald-50 text-emerald-800" },
+  failed: { label: "Failed", className: "border-red-200 bg-red-50 text-red-700" },
+};
+
+/** SKU retry state shown on the original folder row (retries never create a new batch). */
+function RetryStatusBadge({ folder }: { folder: JobFolderRun }) {
+  if (!folder.lastRetryStatus) return null;
+  const style = RETRY_STATUS_STYLE[folder.lastRetryStatus];
+  const active = folder.lastRetryStatus === "queued" || folder.lastRetryStatus === "processing";
+  const title = [
+    folder.retryMode ? `Mode: ${folder.retryMode}` : null,
+    folder.lastRetryAt ? `Requested ${formatDate(folder.lastRetryAt)}` : null,
+    folder.lastRetryStatus === "failed" && folder.lastRetryError ? workflowErrorMessage(folder.lastRetryError) : null,
+  ].filter(Boolean).join("\n");
+  return (
+    <span
+      className={cn("inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-medium", style.className)}
+      title={title || undefined}
+    >
+      {active ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+      Retry #{folder.retryCount} · {style.label}
+    </span>
+  );
 }
 
 function RetryButton({
@@ -2728,7 +2806,11 @@ function JobsPage({
                           </div>
                         </div>
                         <span />
-                        <WorkflowStatusBadge status={folder.status} rawStatus={folder.rawStatus} />
+                        <div className="flex flex-wrap items-center gap-1">
+                          <WorkflowStatusBadge status={folder.status} rawStatus={folder.rawStatus} />
+                <RetryStatusBadge folder={folder} />
+                          <RetryStatusBadge folder={folder} />
+                        </div>
                         <span />
                         <span className="text-xs text-muted-foreground">
                           {folder.imageCount !== null ? `${folder.imageCount} images` : "Not scanned"}

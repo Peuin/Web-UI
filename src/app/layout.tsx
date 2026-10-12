@@ -16,6 +16,13 @@ const montserrat = Montserrat({
 export const metadata: Metadata = {
   title: "Google Drive Media Workflow",
   description: "Browse Google Drive media and run Supabase/n8n workflows.",
+  icons: {
+    icon: [
+      { url: "/favicon.ico?v=2", sizes: "any" },
+      { url: "/icon.png?v=2", type: "image/png", sizes: "32x32" },
+    ],
+    apple: "/apple-icon.png?v=2",
+  },
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

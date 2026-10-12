@@ -90,6 +90,12 @@ export type JobFolderRun = {
   files: { id: string; name: string | null }[];
   attempt: number | null;
   retryAction: string | null;
+  /** SKU retry (workflow-jobs-retry); updates this row instead of creating a batch. */
+  retryCount: number;
+  lastRetryStatus: SkuRetryStatus | null;
+  lastRetryAt: string | null;
+  lastRetryError: string | null;
+  retryMode: "finalize" | "regenerate" | null;
   canRetry: boolean;
   errorMessage?: string;
   startedAt: string | null;
@@ -131,6 +137,11 @@ export type ApiJobFolderRun = {
   files?: { id: string; name: string | null }[];
   attempt: number | null;
   retry_action: string | null;
+  retry_count?: number;
+  last_retry_status?: SkuRetryStatus | null;
+  last_retry_at?: string | null;
+  last_retry_error?: string | null;
+  retry_mode?: "finalize" | "regenerate" | null;
   can_retry: boolean;
   error_message: string | null;
   started_at: string | null;
@@ -241,4 +252,53 @@ export type AuthSession = {
   expires_at?: number;
   token_type: string;
   user: unknown;
+};
+
+/** SKU retry (workflow-jobs-retry Edge Function → n8n Production_08). */
+export type SkuRetryStatus = "queued" | "processing" | "completed" | "failed";
+
+export type SkuRetrySkipReason =
+  | "job_not_found"
+  | "duplicate_request"
+  | "job_not_retryable"
+  | "retry_already_active"
+  | "folder_busy"
+  | "original_name_missing"
+  | "branch_review_required"
+  | "batch_snapshot_missing";
+
+export type SkuRetrySubmitResponse = {
+  request_id: string;
+  accepted: Array<{ job_id: string; batch_id: string; retry_no: number }>;
+  skipped: Array<{ job_id: string; reason: SkuRetrySkipReason }>;
+  /** Requested job IDs replaced by the job currently shown for the same Drive folder. */
+  resolved: Array<{ requested_job_id: string; job_id: string }>;
+};
+
+export type SkuRetryJobStatus = {
+  job_id: string;
+  batch_id: string;
+  source_drive_folder_id: string;
+  source_name: string | null;
+  source_path: string | null;
+  status: string;
+  last_step: string | null;
+  retry_count: number | null;
+  last_retry_status: SkuRetryStatus | null;
+  last_retry_at: string | null;
+  last_retry_error: unknown;
+  completed_via: "initial" | "retry" | null;
+  last_retry_request_id: string | null;
+  last_retry_execution_id: string | null;
+  retry_mode: "finalize" | "regenerate" | null;
+  /** last_retry_request_id equals the polled request_id. */
+  request_matched: boolean;
+  is_terminal: boolean;
+};
+
+export type SkuRetryStatusResponse = {
+  request_id: string | null;
+  jobs: SkuRetryJobStatus[];
+  counts: Record<SkuRetryStatus | "pending", number>;
+  all_terminal: boolean;
 };
