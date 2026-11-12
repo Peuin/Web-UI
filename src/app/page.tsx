@@ -83,9 +83,9 @@ type FolderMeta = {
 
 const DEFAULT_CONNECTION_ID = "00000000-0000-0000-0000-000000000000";
 const DRIVE_ROOT_FOLDER_ID = "1cMsSZ66rvnFvbf4ZRsV1QcpYeOzp0Inq";
-// Generated output root (output_config.folder_id → "FINAL").
-const FINAL_ROOT_FOLDER_ID = "1P0mltH9x4c8VgHDnF662xLiICDUwNZSz";
-const FINAL_ROOT_FOLDER_NAME = "FINAL";
+// Generated output root (output_config.folder_id → "02_AI_PROCESSING").
+const FINAL_ROOT_FOLDER_ID = "1fa_BesuUdYOlqRUnV5eVS3p9FZKfqLzh";
+const FINAL_ROOT_FOLDER_NAME = "02_AI_PROCESSING";
 // Model reference library on Google Drive (n8n Production_07).
 const MODEL_LIBRARY_ROOT_ID = "1lyx87c6tZPE74wHnahta2ByvxR8u52l-";
 const MODEL_LIBRARY_MAX_BYTES = 15 * 1024 * 1024;
