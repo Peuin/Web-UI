@@ -1,0 +1,21 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start Web UI",
+			"type": "shell",
+			"command": "npm install && npm run dev -- --hostname 0.0.0.0 --port 3000",
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Check Node",
+			"type": "shell",
+			"command": "node --version && npm --version",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
