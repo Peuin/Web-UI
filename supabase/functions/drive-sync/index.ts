@@ -143,8 +143,13 @@ function isFreshDriveThumbnail(url: string | null): url is string {
 
 // deno-lint-ignore no-explicit-any
 async function uploadThumbnail(admin: any, path: string, bytes: Uint8Array, contentType: string) {
+  // immutable: a path embeds the file's modified_time, so content never changes.
   const upload = () =>
-    admin.storage.from(THUMBNAIL_BUCKET).upload(path, bytes, { contentType, upsert: true });
+    admin.storage.from(THUMBNAIL_BUCKET).upload(path, bytes, {
+      contentType,
+      cacheControl: "31536000",
+      upsert: true,
+    });
   let { error } = await upload();
   if (error && /bucket not found/i.test(error.message)) {
     const { error: createError } = await admin.storage.createBucket(THUMBNAIL_BUCKET, { public: false });
@@ -202,7 +207,10 @@ async function cacheThumbnails(admin: any, connectionId: string, rows: Thumbnail
         if (!response.ok || !contentType.startsWith("image/")) {
           throw new Error(`HTTP ${response.status} ${contentType}`);
         }
-        const path = `${connectionId}/${row.drive_item_id}.jpg`;
+        // modified_time in the path: a changed file gets a new URL, so a
+        // browser can never see a stale thumbnail under a cached signed URL.
+        const modifiedMs = Date.parse(row.modified_time ?? "") || 0;
+        const path = `${connectionId}/${row.drive_item_id}-${modifiedMs}.jpg`;
         await uploadThumbnail(admin, path, new Uint8Array(await response.arrayBuffer()), contentType);
         row.thumbnail_url = THUMBNAIL_MARKER_PREFIX + path;
         cached += 1;

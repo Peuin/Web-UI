@@ -13,7 +13,7 @@ export function LoginScreen() {
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  async function signIn() {
+  async function signIn(userIdentifier: string, userPassword: string) {
     const supabase = createBrowserSupabaseClient();
     if (!supabase) {
       setErrorMessage(
@@ -24,7 +24,7 @@ export function LoginScreen() {
 
     setLoading(true);
     setErrorMessage(null);
-    const response = await platformApi.login(identifier, password);
+    const response = await platformApi.login(userIdentifier, userPassword);
 
     if (!response.success || !response.data?.session) {
       setLoading(false);
@@ -45,8 +45,11 @@ export function LoginScreen() {
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!loading && identifier && password) {
-      void signIn();
+    const form = new FormData(event.currentTarget);
+    const submittedIdentifier = String(form.get("identifier") ?? identifier).trim();
+    const submittedPassword = String(form.get("password") ?? password);
+    if (!loading && submittedIdentifier && submittedPassword) {
+      void signIn(submittedIdentifier, submittedPassword);
     }
   }
 
@@ -89,6 +92,7 @@ export function LoginScreen() {
                 </label>
                 <input
                   id="identifier"
+                  name="identifier"
                   type="text"
                   autoComplete="username"
                   value={identifier}
@@ -107,6 +111,7 @@ export function LoginScreen() {
                 <div className="relative">
                   <input
                     id="password"
+                    name="password"
                     type={showPassword ? "text" : "password"}
                     autoComplete="current-password"
                     value={password}
@@ -133,16 +138,12 @@ export function LoginScreen() {
 
             <button
               type="submit"
-              disabled={loading || !identifier || !password}
+              disabled={loading}
               className="flex h-11 w-full items-center justify-center gap-2 rounded-none bg-primary px-4 font-montserrat text-sm font-semibold uppercase tracking-[0.05em] text-primary-foreground transition hover:bg-primary-hover disabled:cursor-not-allowed disabled:opacity-50"
             >
               {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
               {loading ? "SIGNING IN…" : "SIGN IN"}
             </button>
-
-            {process.env.NODE_ENV === "development" ? (
-              <p className="text-xs text-[#474747]">Development admin: admin / admin</p>
-            ) : null}
 
             <div className="grid gap-2 text-sm text-[#474747]">
               <div className="flex items-center gap-2">

@@ -3,7 +3,8 @@ import { createClient } from "jsr:@supabase/supabase-js@2.112.4";
 // Model reference library on Google Drive, served by n8n workflow
 // Production_07 model library workflow (webhook POST /model-references).
 const MODEL_LIBRARY_WEBHOOK_URL = "https://automation.oxmode.ai/webhook/model-references";
-const DEFAULT_MODEL_FOLDER_ID = "1lyx87c6tZPE74wHnahta2ByvxR8u52l-";
+// Google Drive folder "05_MODEL".
+const DEFAULT_MODEL_FOLDER_ID = "18K-yWcm-qshgE9_UjQ6s5m64g7Ar43jr";
 const MAX_UPLOAD_BYTES = 15 * 1024 * 1024;
 const IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
 const DRIVE_ID_RE = /^[A-Za-z0-9_-]{10,}$/;

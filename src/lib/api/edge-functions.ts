@@ -161,6 +161,9 @@ export const platformApi = {
       items: ApiDriveItem[];
       pagination: unknown;
       cache?: "HIT" | "MISS" | "DISABLED";
+      // Present when the request passes ancestors=1 — root→parent chain for
+      // rebuilding breadcrumbs after a deep-link reload.
+      ancestors?: ApiDriveItem[];
     }>(
       `drive-list-folder?${params.toString()}`,
       accessToken,

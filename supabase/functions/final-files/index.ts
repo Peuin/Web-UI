@@ -1,4 +1,4 @@
-import { createClient } from "jsr:@supabase/supabase-js@2.112.4";
+import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2.112.4";
 
 const FINAL_FILES_WEBHOOK_URL = "https://automation.oxmode.ai/webhook/final-files";
 // Generated output root (output_config.folder_id → "02_AI_PROCESSING").
@@ -44,6 +44,7 @@ type FinalFilesRequest = {
   run_id?: string;
   limit?: number;
   items?: unknown;
+  ancestors?: boolean;
 };
 
 // Same cache as drive-sync: Drive thumbnailLink expires within hours, so the
@@ -55,6 +56,13 @@ const THUMBNAIL_SIZE = "s400";
 const THUMBNAIL_CONCURRENCY = 5;
 const THUMBNAIL_FETCH_TIMEOUT_MS = 10_000;
 const THUMBNAIL_SIGNED_URL_TTL = 3600;
+// Keep one signed URL alive (minus this margin) so browsers can cache images.
+const SIGNED_URL_CACHE_MARGIN_SECONDS = 300;
+const MAX_ANCESTOR_DEPTH = 20;
+// Every column except raw_payload, which is write-side bookkeeping for n8n.
+const FINAL_ITEM_COLUMNS =
+  "id,drive_item_id,parent_drive_item_id,name,mime_type,item_type,size_bytes,thumbnail_url,web_view_link,modified_time,source_folder_id,created_at,updated_at";
+const signedUrlMemoryCache = new Map<string, { url: string; expiresAt: number }>();
 
 function isFreshDriveThumbnail(url: string | null): url is string {
   if (!url) return false;
@@ -68,8 +76,13 @@ function isFreshDriveThumbnail(url: string | null): url is string {
 
 // deno-lint-ignore no-explicit-any
 async function uploadThumbnail(admin: any, path: string, bytes: Uint8Array, contentType: string) {
+  // immutable: a path embeds the file's modified_time, so content never changes.
   const upload = () =>
-    admin.storage.from(THUMBNAIL_BUCKET).upload(path, bytes, { contentType, upsert: true });
+    admin.storage.from(THUMBNAIL_BUCKET).upload(path, bytes, {
+      contentType,
+      cacheControl: "31536000",
+      upsert: true,
+    });
   let { error } = await upload();
   if (error && /bucket not found/i.test(error.message)) {
     const { error: createError } = await admin.storage.createBucket(THUMBNAIL_BUCKET, { public: false });
@@ -122,7 +135,10 @@ async function cacheThumbnails(admin: any, items: FinalItem[]) {
         if (!response.ok || !contentType.startsWith("image/")) {
           throw new Error(`HTTP ${response.status} ${contentType}`);
         }
-        const path = `${THUMBNAIL_PATH_PREFIX}/${item.drive_item_id}.jpg`;
+        // modified_time in the path: a changed file gets a new URL, so a
+        // browser can never see a stale thumbnail under a cached signed URL.
+        const modifiedMs = Date.parse(item.modified_time ?? "") || 0;
+        const path = `${THUMBNAIL_PATH_PREFIX}/${item.drive_item_id}-${modifiedMs}.jpg`;
         await uploadThumbnail(admin, path, new Uint8Array(await response.arrayBuffer()), contentType);
         item.thumbnail_url = THUMBNAIL_MARKER_PREFIX + path;
         cached += 1;
@@ -150,18 +166,12 @@ async function signThumbnailField<T extends Record<string, unknown>>(
     .map((url) => url.slice(THUMBNAIL_MARKER_PREFIX.length));
   if (paths.length === 0) return items;
 
-  const signedByPath = new Map<string, string>();
-  try {
-    const { data, error } = await admin.storage
-      .from(THUMBNAIL_BUCKET)
-      .createSignedUrls(paths, THUMBNAIL_SIGNED_URL_TTL);
-    if (error) throw error;
-    for (const entry of data ?? []) {
-      if (entry.path && entry.signedUrl) signedByPath.set(entry.path, entry.signedUrl);
-    }
-  } catch (error) {
-    console.error("Thumbnail signing failed:", error);
-  }
+  const signedByPath = await cachedSignedUrls(
+    admin.storage,
+    THUMBNAIL_BUCKET,
+    paths,
+    THUMBNAIL_SIGNED_URL_TTL,
+  );
 
   return items.map((item) => {
     const url = item[field];
@@ -170,11 +180,149 @@ async function signThumbnailField<T extends Record<string, unknown>>(
   });
 }
 
-function json(body: unknown, status = 200) {
+function json(body: unknown, status = 200, timing?: string) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json",
+      ...(timing ? { "Server-Timing": timing } : {}),
+    },
   });
+}
+
+/** Server-Timing helper: `t.mark("auth")` then `t.header()` → "auth;dur=12.3,total;dur=…". */
+function createTiming() {
+  const start = performance.now();
+  const marks: [string, number][] = [];
+  return {
+    mark(name: string) {
+      marks.push([name, performance.now() - start]);
+    },
+    header() {
+      const parts = marks.map(([name, at], i) => {
+        const prev = i === 0 ? 0 : marks[i - 1][1];
+        return `${name};dur=${(at - prev).toFixed(1)}`;
+      });
+      parts.push(`total;dur=${(performance.now() - start).toFixed(1)}`);
+      return parts.join(", ");
+    },
+  };
+}
+
+function redisConfig() {
+  const url = Deno.env.get("REDIS_REST_URL")?.replace(/\/+$/, "");
+  const token = Deno.env.get("REDIS_REST_TOKEN");
+  return url && token ? { url, token } : null;
+}
+
+async function redisCommand<T>(command: unknown[]): Promise<T | null> {
+  const config = redisConfig();
+  if (!config) return null;
+
+  const response = await fetch(config.url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(command),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Redis command failed with HTTP ${response.status}`);
+  }
+
+  const body = await response.json();
+  if (body?.error) {
+    throw new Error(String(body.error));
+  }
+  return body?.result as T;
+}
+
+/**
+ * Signed URLs keyed by storage path, cached in Redis (or in-isolate memory) so
+ * list responses return one stable URL per path — that is what lets the browser
+ * cache thumbnail images between folder opens.
+ */
+async function cachedSignedUrls(
+  storageClient: SupabaseClient["storage"],
+  bucket: string,
+  paths: string[],
+  ttlSeconds: number,
+): Promise<Map<string, string>> {
+  const now = Date.now();
+  const refreshAfter = now + SIGNED_URL_CACHE_MARGIN_SECONDS * 1000;
+  const result = new Map<string, string>();
+  const misses: string[] = [];
+
+  for (const path of paths) {
+    const hit = signedUrlMemoryCache.get(path);
+    if (hit && hit.expiresAt > refreshAfter) {
+      result.set(path, hit.url);
+    } else {
+      misses.push(path);
+    }
+  }
+
+  if (misses.length > 0 && redisConfig()) {
+    try {
+      const keys = misses.map((path) => `thumb:url:${bucket}:${path}`);
+      const cached = await redisCommand<(string | null)[]>(["MGET", ...keys]);
+      const stillMissing: string[] = [];
+      misses.forEach((path, index) => {
+        // Stored as {url, expiresAt} so a hit keeps the URL's real expiry.
+        let hit: { url?: unknown; expiresAt?: unknown } | null = null;
+        try {
+          hit = cached?.[index] ? JSON.parse(cached[index]!) : null;
+        } catch {
+          hit = null;
+        }
+        if (hit && typeof hit.url === "string" && typeof hit.expiresAt === "number" && hit.expiresAt > refreshAfter) {
+          result.set(path, hit.url);
+          signedUrlMemoryCache.set(path, { url: hit.url, expiresAt: hit.expiresAt });
+        } else {
+          stillMissing.push(path);
+        }
+      });
+      misses.length = 0;
+      misses.push(...stillMissing);
+    } catch (error) {
+      console.error("Redis signed-URL cache read failed:", error);
+    }
+  }
+
+  if (misses.length > 0) {
+    try {
+      const { data, error } = await storageClient
+        .from(bucket)
+        .createSignedUrls(misses, ttlSeconds);
+      if (error) throw error;
+      const writes: Promise<unknown>[] = [];
+      for (const entry of data ?? []) {
+        if (!entry.path || !entry.signedUrl) continue;
+        const expiresAt = now + ttlSeconds * 1000;
+        result.set(entry.path, entry.signedUrl);
+        signedUrlMemoryCache.set(entry.path, { url: entry.signedUrl, expiresAt });
+        if (redisConfig()) {
+          writes.push(redisCommand([
+            "SET",
+            `thumb:url:${bucket}:${entry.path}`,
+            JSON.stringify({ url: entry.signedUrl, expiresAt }),
+            "EX",
+            ttlSeconds - SIGNED_URL_CACHE_MARGIN_SECONDS,
+          ]).catch((error: unknown) => {
+            console.error("Redis signed-URL cache write failed:", error);
+          }));
+        }
+      }
+      await Promise.all(writes);
+    } catch (error) {
+      console.error("Thumbnail signing failed:", error);
+    }
+  }
+
+  return result;
 }
 
 function apiError(code: string, message: string, status = 400) {
@@ -356,7 +504,7 @@ async function listFinalFiles({
 }) {
   let query = admin
     .from("final_items")
-    .select("*")
+    .select(FINAL_ITEM_COLUMNS)
     .eq("source_folder_id", sourceFolderId)
     .neq("item_type", "FOLDER");
 
@@ -425,6 +573,27 @@ async function listFinalFiles({
   };
 }
 
+/** Deletes every cached row below the given (already removed) folders. */
+async function removeDescendants(admin: SupabaseClient, folderIds: string[]) {
+  let removed = 0;
+  let frontier = folderIds;
+  for (let depth = 0; frontier.length > 0 && depth < 20; depth++) {
+    const next: string[] = [];
+    for (let i = 0; i < frontier.length; i += 200) {
+      const { data, error } = await admin
+        .from("final_items")
+        .delete()
+        .in("parent_drive_item_id", frontier.slice(i, i + 200))
+        .select("drive_item_id, item_type");
+      if (error) throw error;
+      removed += data?.length ?? 0;
+      for (const row of data ?? []) if (row.item_type === "FOLDER") next.push(row.drive_item_id);
+    }
+    frontier = next;
+  }
+  return removed;
+}
+
 async function handleN8nCallback(req: Request, body: FinalFilesRequest) {
   const internalSecret = Deno.env.get("N8N_INTERNAL_SECRET");
   if (
@@ -483,21 +652,36 @@ async function handleN8nCallback(req: Request, body: FinalFilesRequest) {
     if (error) return apiError("SUPABASE_ERROR", error.message, 500);
   }
 
-  // Reconcile the listed folder: drop rows Drive no longer returns.
+  // Reconcile the listed folder: drop rows Drive no longer returns. With an
+  // explicit folder_id an empty listing is trusted too (last child deleted).
   const parentIds = new Set(normalizedItems.map((item) => item.parent_drive_item_id));
   const reconciledFolderId = explicitFolderId ??
     (parentIds.size === 1 ? [...parentIds][0] : null);
   let removed = 0;
-  if (reconciledFolderId && normalizedItems.length > 0) {
-    const keepIds = normalizedItems.map((item) => `"${item.drive_item_id.replaceAll('"', '""')}"`).join(",");
-    const { data: removedRows, error: removeError } = await admin
+  if (reconciledFolderId && (explicitFolderId || normalizedItems.length > 0)) {
+    let query = admin
       .from("final_items")
       .delete()
       .eq("parent_drive_item_id", reconciledFolderId)
-      .not("drive_item_id", "in", `(${keepIds})`)
-      .select("drive_item_id");
+      .neq("drive_item_id", reconciledFolderId);
+    if (normalizedItems.length > 0) {
+      const keepIds = normalizedItems.map((item) => `"${item.drive_item_id.replaceAll('"', '""')}"`).join(",");
+      query = query.not("drive_item_id", "in", `(${keepIds})`);
+    }
+    const { data: removedRows, error: removeError } = await query.select("drive_item_id, item_type");
     if (removeError) return apiError("SUPABASE_ERROR", removeError.message, 500);
     removed = removedRows?.length ?? 0;
+    try {
+      removed += await removeDescendants(
+        admin,
+        (removedRows ?? [])
+          .filter((row: { item_type?: string; drive_item_id?: string }) => row.item_type === "FOLDER")
+          .map((row: { drive_item_id?: string }) => row.drive_item_id)
+          .filter((id: string | undefined): id is string => Boolean(id)),
+      );
+    } catch (descendantError) {
+      console.error("Descendant cleanup failed:", descendantError);
+    }
   }
 
   return json({
@@ -518,27 +702,50 @@ async function handleN8nCallback(req: Request, body: FinalFilesRequest) {
 async function listFinalFolder({
   admin,
   folderId,
+  withAncestors,
 }: {
   // deno-lint-ignore no-explicit-any
   admin: any;
   folderId: string;
+  withAncestors?: boolean;
 }) {
-  const { data: rows, error } = await admin
-    .from("final_items")
-    .select("*")
-    .eq("parent_drive_item_id", folderId)
-    .neq("drive_item_id", folderId)
-    .order("item_type", { ascending: true })
-    .order("modified_time", { ascending: false, nullsFirst: false })
-    .limit(FINAL_LIST_LIMIT);
-  if (error) throw error;
+  const [listResult, folderResult] = await Promise.all([
+    admin
+      .from("final_items")
+      .select(FINAL_ITEM_COLUMNS)
+      .eq("parent_drive_item_id", folderId)
+      .neq("drive_item_id", folderId)
+      .order("item_type", { ascending: true })
+      .order("modified_time", { ascending: false, nullsFirst: false })
+      .limit(FINAL_LIST_LIMIT),
+    admin
+      .from("final_items")
+      .select(FINAL_ITEM_COLUMNS)
+      .eq("drive_item_id", folderId)
+      .maybeSingle(),
+  ]);
+  if (listResult.error) throw listResult.error;
+  if (folderResult.error) throw folderResult.error;
+  const rows = listResult.data;
+  const folder = folderResult.data;
 
-  const { data: folder, error: folderError } = await admin
-    .from("final_items")
-    .select("*")
-    .eq("drive_item_id", folderId)
-    .maybeSingle();
-  if (folderError) throw folderError;
+  const ancestors: { drive_item_id: string; name: string }[] = [];
+  if (withAncestors) {
+    const seen = new Set<string>([folderId]);
+    let cursor = folder?.parent_drive_item_id ?? null;
+    for (let depth = 0; cursor && depth < MAX_ANCESTOR_DEPTH && !seen.has(cursor); depth++) {
+      seen.add(cursor);
+      const { data, error } = await admin
+        .from("final_items")
+        .select("drive_item_id,name,parent_drive_item_id")
+        .eq("drive_item_id", cursor)
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) break;
+      ancestors.unshift({ drive_item_id: data.drive_item_id, name: data.name });
+      cursor = data.parent_drive_item_id;
+    }
+  }
 
   const toDriveItem = (row: FinalItemRow & { id: string }) => ({
     id: row.id,
@@ -560,6 +767,7 @@ async function listFinalFolder({
   return {
     folder_id: folderId,
     folder: folder ? toDriveItem(folder) : null,
+    ancestors: withAncestors ? ancestors : undefined,
     items: await signThumbnailField(admin, (rows ?? []).map(toDriveItem), "thumbnail_url"),
   };
 }
@@ -643,6 +851,7 @@ Deno.serve(async (req) => {
     return apiError("UNAUTHORIZED", "Missing Authorization header.", 401);
   }
 
+  const timing = createTiming();
   const supabase = createClient(supabaseUrl, publishableKey, {
     global: { headers: { Authorization: authHeader } },
     auth: { persistSession: false, autoRefreshToken: false },
@@ -651,10 +860,26 @@ Deno.serve(async (req) => {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
-  const { data: { user }, error: authError } = await supabase.auth.getUser();
-  if (authError || !user) {
-    return apiError("UNAUTHORIZED", "Invalid session.", 401);
+  // Verify the JWT locally via JWKS; fall back to an Auth round-trip when the
+  // project can't do claims verification (e.g. legacy HS256 without JWKS).
+  const jwt = authHeader.replace(/^Bearer\s+/i, "");
+  let user: { id: string } | null = null;
+  try {
+    const { data, error } = await supabase.auth.getClaims(jwt);
+    if (!error && data?.claims?.sub) user = { id: String(data.claims.sub) };
+  } catch {
+    // getClaims not usable in this environment; getUser below decides.
   }
+  if (!user) {
+    const { data: { user: fetched }, error: authError } = await supabase.auth.getUser();
+    if (authError || !fetched) {
+      return apiError("UNAUTHORIZED", "Invalid session.", 401);
+    }
+    user = fetched;
+  }
+  timing.mark("auth");
+  // `user` is guaranteed non-null past the 401 guard above.
+  const userId = (user as { id: string }).id;
 
   const filters: {
     from_date?: Date;
@@ -682,8 +907,9 @@ Deno.serve(async (req) => {
   // Folder browsing for the Final Output tab, backed by final_items.
   if (body.action === "list") {
     try {
-      const data = await listFinalFolder({ admin, folderId: sourceFolderId });
-      return json({ success: true, data, request_id: crypto.randomUUID() });
+      const data = await listFinalFolder({ admin, folderId: sourceFolderId, withAncestors: body.ancestors === true });
+      timing.mark("db");
+      return json({ success: true, data, request_id: crypto.randomUUID() }, 200, timing.header());
     } catch (error: unknown) {
       console.error("Final files list error:", error);
       return apiError(
@@ -704,7 +930,7 @@ Deno.serve(async (req) => {
         n8nWebhookUrl: webhookUrl,
         internalSecret,
         sourceFolderId,
-        userId: user.id,
+        userId,
       });
       return json({
         success: true,
@@ -738,9 +964,10 @@ Deno.serve(async (req) => {
       n8nWebhookUrl: webhookUrl,
       internalSecret,
       sourceFolderId,
-      userId: user.id,
+      userId,
     });
     const data = await listFinalFiles({ admin, sourceFolderId, filters });
+    timing.mark("db");
 
     return json({
       success: true,
@@ -753,7 +980,7 @@ Deno.serve(async (req) => {
         n8n_response: n8nResponse,
       },
       request_id: crypto.randomUUID(),
-    });
+    }, 200, timing.header());
   } catch (error: unknown) {
     console.error("Final files error:", error);
     return apiError(

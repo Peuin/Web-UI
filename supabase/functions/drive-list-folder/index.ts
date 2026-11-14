@@ -1,9 +1,13 @@
-import { createClient } from "jsr:@supabase/supabase-js@2.112.4";
+import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2.112.4";
 
 const DEFAULT_BUCKET = "BAartworkShopify";
 const DEFAULT_ROOT_PATH = "google-drive/01_New_Product_Raw";
 const DEFAULT_DRIVE_SYNC_ROOT_FOLDER_ID = "1cMsSZ66rvnFvbf4ZRsV1QcpYeOzp0Inq";
 const FOLDER_CACHE_TTL_SECONDS = 600;
+// raw_payload-scale fields are excluded; the UI only needs these columns.
+const DRIVE_ITEM_COLUMNS =
+  "id,connection_id,drive_item_id,parent_drive_item_id,name,mime_type,item_type,size_bytes,thumbnail_url,web_view_link,modified_time,sync_status,cached_storage_path,cached_at,created_at,updated_at";
+const MAX_ANCESTOR_DEPTH = 20;
 
 type StorageObject = {
   id?: string | null;
@@ -23,11 +27,34 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
 };
 
-function json(body: unknown, status = 200) {
+function json(body: unknown, status = 200, timing?: string) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json",
+      ...(timing ? { "Server-Timing": timing } : {}),
+    },
   });
+}
+
+/** Server-Timing helper: `t.mark("auth")` then `t.header()` → "auth;dur=12.3,total;dur=…". */
+function createTiming() {
+  const start = performance.now();
+  const marks: [string, number][] = [];
+  return {
+    mark(name: string) {
+      marks.push([name, performance.now() - start]);
+    },
+    header() {
+      const parts = marks.map(([name, at], i) => {
+        const prev = i === 0 ? 0 : marks[i - 1][1];
+        return `${name};dur=${(at - prev).toFixed(1)}`;
+      });
+      parts.push(`total;dur=${(performance.now() - start).toFixed(1)}`);
+      return parts.join(", ");
+    },
+  };
 }
 
 function apiError(code: string, message: string, status = 400) {
@@ -152,11 +179,100 @@ function exposeDriveItem(item: Record<string, unknown>) {
 // Set by drive-sync when it caches a Drive thumbnail into private Storage.
 const THUMBNAIL_MARKER_PREFIX = "supabase-storage://drive-thumbnails/";
 const THUMBNAIL_SIGNED_URL_TTL = 3600;
+// Re-serve one signed URL until this margin before expiry so the browser can
+// cache the image by URL instead of refetching every list request.
+const SIGNED_URL_CACHE_MARGIN_SECONDS = 300;
+const signedUrlMemoryCache = new Map<string, { url: string; expiresAt: number }>();
+
+/**
+ * Signed URLs keyed by storage path, cached in Redis (or in-isolate memory) so
+ * every list response returns the identical URL until it nears expiry. That
+ * makes thumbnails browser-cacheable; a fresh token is only minted inside the
+ * last SIGNED_URL_CACHE_MARGIN_SECONDS of the previous URL's life.
+ */
+async function cachedSignedUrls(
+  storageClient: SupabaseClient["storage"],
+  bucket: string,
+  paths: string[],
+  ttlSeconds: number,
+): Promise<Map<string, string>> {
+  const now = Date.now();
+  const refreshAfter = now + SIGNED_URL_CACHE_MARGIN_SECONDS * 1000;
+  const result = new Map<string, string>();
+  const misses: string[] = [];
+
+  for (const path of paths) {
+    const hit = signedUrlMemoryCache.get(path);
+    if (hit && hit.expiresAt > refreshAfter) {
+      result.set(path, hit.url);
+    } else {
+      misses.push(path);
+    }
+  }
+
+  if (misses.length > 0 && redisConfig()) {
+    try {
+      const keys = misses.map((path) => `thumb:url:${bucket}:${path}`);
+      const cached = await redisCommand<(string | null)[]>(["MGET", ...keys]);
+      const stillMissing: string[] = [];
+      misses.forEach((path, index) => {
+        // Stored as {url, expiresAt} so a hit keeps the URL's real expiry.
+        let hit: { url?: unknown; expiresAt?: unknown } | null = null;
+        try {
+          hit = cached?.[index] ? JSON.parse(cached[index]!) : null;
+        } catch {
+          hit = null;
+        }
+        if (hit && typeof hit.url === "string" && typeof hit.expiresAt === "number" && hit.expiresAt > refreshAfter) {
+          result.set(path, hit.url);
+          signedUrlMemoryCache.set(path, { url: hit.url, expiresAt: hit.expiresAt });
+        } else {
+          stillMissing.push(path);
+        }
+      });
+      misses.length = 0;
+      misses.push(...stillMissing);
+    } catch (error) {
+      console.error("Redis signed-URL cache read failed:", error);
+    }
+  }
+
+  if (misses.length > 0) {
+    try {
+      const { data, error } = await storageClient
+        .from(bucket)
+        .createSignedUrls(misses, ttlSeconds);
+      if (error) throw error;
+      const writes: Promise<unknown>[] = [];
+      for (const entry of data ?? []) {
+        if (!entry.path || !entry.signedUrl) continue;
+        const expiresAt = now + ttlSeconds * 1000;
+        result.set(entry.path, entry.signedUrl);
+        signedUrlMemoryCache.set(entry.path, { url: entry.signedUrl, expiresAt });
+        if (redisConfig()) {
+          writes.push(redisCommand([
+            "SET",
+            `thumb:url:${bucket}:${entry.path}`,
+            JSON.stringify({ url: entry.signedUrl, expiresAt }),
+            "EX",
+            ttlSeconds - SIGNED_URL_CACHE_MARGIN_SECONDS,
+          ]).catch((error: unknown) => {
+            console.error("Redis signed-URL cache write failed:", error);
+          }));
+        }
+      }
+      await Promise.all(writes);
+    } catch (error) {
+      console.error("Thumbnail signing failed:", error);
+    }
+  }
+
+  return result;
+}
 
 /** Signs cached-thumbnail markers per response; Redis keeps the unsigned markers. */
 async function signThumbnails(
-  // deno-lint-ignore no-explicit-any
-  admin: any,
+  admin: SupabaseClient,
   items: Record<string, unknown>[],
 ): Promise<Record<string, unknown>[]> {
   const paths = items
@@ -165,18 +281,12 @@ async function signThumbnails(
     .map((url) => url.slice(THUMBNAIL_MARKER_PREFIX.length));
   if (paths.length === 0) return items;
 
-  const signedByPath = new Map<string, string>();
-  try {
-    const { data, error } = await admin.storage
-      .from("drive-thumbnails")
-      .createSignedUrls(paths, THUMBNAIL_SIGNED_URL_TTL);
-    if (error) throw error;
-    for (const entry of data ?? []) {
-      if (entry.path && entry.signedUrl) signedByPath.set(entry.path, entry.signedUrl);
-    }
-  } catch (error) {
-    console.error("Thumbnail signing failed:", error);
-  }
+  const signedByPath = await cachedSignedUrls(
+    admin.storage,
+    "drive-thumbnails",
+    paths,
+    THUMBNAIL_SIGNED_URL_TTL,
+  );
 
   return items.map((item) => {
     const url = item.thumbnail_url;
@@ -292,13 +402,14 @@ async function resolveRootFolderId({
     DEFAULT_DRIVE_SYNC_ROOT_FOLDER_ID;
 }
 
+/** Fetches one extra row to derive has_more without a separate count query. */
 async function listDriveMetadataFolder({
   admin,
   connectionId,
   folderId,
   search,
   from,
-  to,
+  limit,
   sort,
 }: {
   // deno-lint-ignore no-explicit-any
@@ -307,12 +418,12 @@ async function listDriveMetadataFolder({
   folderId: string;
   search?: string;
   from: number;
-  to: number;
+  limit: number;
   sort: string;
 }) {
   let query = admin
     .from("drive_items")
-    .select("*", { count: "exact" })
+    .select(DRIVE_ITEM_COLUMNS)
     .eq("connection_id", connectionId)
     .eq("parent_drive_item_id", folderId)
     .neq("drive_item_id", folderId)
@@ -342,27 +453,65 @@ async function listDriveMetadataFolder({
       .order("name", { ascending: true });
   }
 
-  query = query.range(from, to - 1);
+  query = query.range(from, from + limit - 1);
 
-  const { data, error, count } = await query;
-  if (error) throw error;
+  // The list and the parent-folder lookup are independent — run them together.
+  const [listResult, folderResult] = await Promise.all([
+    query,
+    admin
+      .from("drive_items")
+      .select(DRIVE_ITEM_COLUMNS)
+      .eq("connection_id", connectionId)
+      .eq("drive_item_id", folderId)
+      .is("deleted_at", null)
+      .neq("sync_status", "DELETED")
+      .maybeSingle(),
+  ]);
 
-  const { data: folder, error: folderError } = await admin
-    .from("drive_items")
-    .select("*")
-    .eq("connection_id", connectionId)
-    .eq("drive_item_id", folderId)
-    .is("deleted_at", null)
-    .neq("sync_status", "DELETED")
-    .maybeSingle();
+  if (listResult.error) throw listResult.error;
+  if (folderResult.error) throw folderResult.error;
 
-  if (folderError) throw folderError;
-
+  const rows = listResult.data ?? [];
   return {
-    folder: folder ? exposeDriveItem(folder) : null,
-    items: (data ?? []).map(exposeDriveItem),
-    total: count ?? data?.length ?? 0,
+    folder: folderResult.data ? exposeDriveItem(folderResult.data) : null,
+    items: rows.slice(0, limit - 1).map(exposeDriveItem),
+    hasMore: rows.length >= limit,
   };
+}
+
+/** Walks parent_drive_item_id up to the root so a deep link can rebuild breadcrumbs. */
+async function loadAncestors({
+  admin,
+  connectionId,
+  folderId,
+  parentId,
+}: {
+  // deno-lint-ignore no-explicit-any
+  admin: any;
+  connectionId: string;
+  folderId: string;
+  parentId: string | null;
+}) {
+  const ancestors: { drive_item_id: string; name: string }[] = [];
+  const seen = new Set<string>([folderId]);
+  let cursor = parentId;
+
+  for (let depth = 0; cursor && depth < MAX_ANCESTOR_DEPTH && !seen.has(cursor); depth++) {
+    seen.add(cursor);
+    const { data, error } = await admin
+      .from("drive_items")
+      .select("drive_item_id,name,parent_drive_item_id")
+      .eq("connection_id", connectionId)
+      .eq("drive_item_id", cursor)
+      .is("deleted_at", null)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) break;
+    ancestors.unshift({ drive_item_id: data.drive_item_id, name: data.name });
+    cursor = data.parent_drive_item_id;
+  }
+
+  return ancestors;
 }
 
 async function listStoragePath({
@@ -390,7 +539,7 @@ async function listStoragePath({
   if (error) throw error;
 
   const normalizedSearch = search?.toLowerCase();
-  const rows = [];
+  const candidates: { itemPath: string; object: StorageObject; isFolder: boolean }[] = [];
 
   for (const object of data ?? []) {
     const itemPath = normalizePath(
@@ -403,23 +552,25 @@ async function listStoragePath({
     ) {
       continue;
     }
+    candidates.push({ itemPath, object, isFolder: !object.id && !object.metadata });
+  }
 
-    let signedUrl: string | null = null;
-    const isFolder = !object.id && !object.metadata;
-    if (!isFolder) {
-      const { data: signed } = await storage
-        .from(bucket)
-        .createSignedUrl(itemPath, signedUrlTtl);
-      signedUrl = signed?.signedUrl ?? null;
-    }
+  // One batch sign for every file; cached URLs keep the browser's image cache hot.
+  const signedByPath = await cachedSignedUrls(
+    storage,
+    bucket,
+    candidates.filter((entry) => !entry.isFolder).map((entry) => entry.itemPath),
+    signedUrlTtl,
+  );
 
-    rows.push(storageObjectToDriveItem({
+  const rows = candidates.map(({ itemPath, object, isFolder }) =>
+    storageObjectToDriveItem({
       bucket,
       path: itemPath,
       object,
-      signedUrl,
-    }));
-  }
+      signedUrl: isFolder ? null : signedByPath.get(itemPath) ?? null,
+    })
+  );
 
   rows.sort((a, b) => {
     if (a.item_type === "FOLDER" && b.item_type !== "FOLDER") return -1;
@@ -506,6 +657,7 @@ Deno.serve(async (req) => {
     );
   }
 
+  const timing = createTiming();
   const supabase = createClient(supabaseUrl, publishableKey, {
     global: { headers: { Authorization: authHeader } },
     auth: { persistSession: false, autoRefreshToken: false },
@@ -514,10 +666,24 @@ Deno.serve(async (req) => {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
-  const { data: { user }, error: authError } = await supabase.auth.getUser();
-  if (authError || !user) {
-    return apiError("UNAUTHORIZED", "Invalid session.", 401);
+  // Verify the JWT locally via JWKS; fall back to an Auth round-trip when the
+  // project can't do claims verification (e.g. legacy HS256 without JWKS).
+  const jwt = authHeader.replace(/^Bearer\s+/i, "");
+  let user: { id: string } | null = null;
+  try {
+    const { data, error } = await supabase.auth.getClaims(jwt);
+    if (!error && data?.claims?.sub) user = { id: String(data.claims.sub) };
+  } catch {
+    // getClaims not usable in this environment; getUser below decides.
   }
+  if (!user) {
+    const { data: { user: fetched }, error: authError } = await supabase.auth.getUser();
+    if (authError || !fetched) {
+      return apiError("UNAUTHORIZED", "Invalid session.", 401);
+    }
+    user = fetched;
+  }
+  timing.mark("auth");
 
   const url = new URL(req.url);
   let body: Record<string, unknown> = {};
@@ -548,6 +714,8 @@ Deno.serve(async (req) => {
   const requestedStoragePath = normalizePath(paramValue("storage_path"));
   const recursive = url.searchParams.get("recursive") === "true" ||
     body.recursive === true;
+  const withAncestors = url.searchParams.get("ancestors") === "true" ||
+    body.ancestors === true;
   const search = url.searchParams.get("search")?.trim();
   const sort = url.searchParams.get("sort")?.trim() || "modified_desc";
   const page = Math.max(Number(url.searchParams.get("page") ?? "1"), 1);
@@ -582,17 +750,20 @@ Deno.serve(async (req) => {
       try {
         const cached = await readFolderCache<Record<string, unknown>>(cacheKeys.key);
         if (cached) {
+          timing.mark("cache");
+          const signedCached = Array.isArray(cached.items)
+            ? await signThumbnails(admin, cached.items as Record<string, unknown>[])
+            : cached.items;
+          timing.mark("sign");
           return json({
             success: true,
             data: {
               ...cached,
-              items: Array.isArray(cached.items)
-                ? await signThumbnails(admin, cached.items as Record<string, unknown>[])
-                : cached.items,
+              items: signedCached,
               cache: "HIT",
             },
             request_id: crypto.randomUUID(),
-          });
+          }, 200, timing.header());
         }
       } catch (error) {
         console.error("Redis cache read failed:", error);
@@ -608,22 +779,32 @@ Deno.serve(async (req) => {
         folderId,
         search,
         from,
-        to,
+        limit: pageSize + 1,
         sort,
       });
+    timing.mark("db");
 
     if (
       metadata &&
       (metadata.items.length > 0 || requestedFolderId || requestedRootFolderId)
     ) {
+      const ancestors = withAncestors && metadata.folder
+        ? await loadAncestors({
+          admin,
+          connectionId,
+          folderId,
+          parentId: metadata.folder.parent_drive_item_id as string | null,
+        })
+        : undefined;
       const responseData = {
         folder: metadata.folder,
         items: metadata.items,
+        ancestors,
         pagination: {
           page,
           page_size: pageSize,
-          total: metadata.total,
-          has_more: metadata.total > to,
+          total: null,
+          has_more: metadata.hasMore,
         },
       };
 
@@ -640,15 +821,17 @@ Deno.serve(async (req) => {
         }
       }
 
+      const signedItems = await signThumbnails(admin, responseData.items);
+      timing.mark("sign");
       return json({
         success: true,
         data: {
           ...responseData,
-          items: await signThumbnails(admin, responseData.items),
+          items: signedItems,
           cache,
         },
         request_id: crypto.randomUUID(),
-      });
+      }, 200, timing.header());
     }
 
     const storageFolderId = requestedStoragePath ||
@@ -669,6 +852,7 @@ Deno.serve(async (req) => {
         signedUrlTtl,
       });
 
+    timing.mark("storage");
     const pageItems = items.slice(from, to);
     const folder = storageFolderId === rootPath ? null : {
       id: `${bucket}:${storageFolderId}`,
@@ -691,6 +875,15 @@ Deno.serve(async (req) => {
     const responseData = {
       folder,
       items: pageItems.map(exposeDriveItem),
+      // Storage paths are self-describing: ancestors are just the path segments.
+      ancestors: withAncestors
+        ? normalizePath(storageFolderId).split("/").filter(Boolean)
+          .slice(0, -1)
+          .map((_, index, segments) => ({
+            drive_item_id: segments.slice(0, index + 1).join("/"),
+            name: segments[index],
+          }))
+        : undefined,
       pagination: {
         page,
         page_size: pageSize,
@@ -719,7 +912,7 @@ Deno.serve(async (req) => {
         cache,
       },
       request_id: crypto.randomUUID(),
-    });
+    }, 200, timing.header());
   } catch (error: unknown) {
     console.error("Storage Error:", error);
     return apiError(
