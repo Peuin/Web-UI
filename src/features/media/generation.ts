@@ -46,6 +46,7 @@ export function validateReferenceImageUrl(label: string, value: string | null): 
 export type GenerationFormValues = {
   productType: string;
   productDescription: string;
+  conceptStyle: string;
   samplePrompt: string;
   sourceStoragePrefix: string;
   modelReferenceUrl: string;

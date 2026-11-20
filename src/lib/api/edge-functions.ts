@@ -323,6 +323,7 @@ export const platformApi = {
       parameters: {
         product_type: string;
         product_description: string;
+        concept_style: string;
         sample_prompt: string;
         source_storage_prefix: string;
         model_reference_url: string | null;

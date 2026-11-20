@@ -149,6 +149,17 @@ export function PreviewDrawer({
               </div>
 
               <div>
+                <label htmlFor="gen-concept-style" className="mb-1 block text-xs font-medium text-muted-foreground">Concept/Style</label>
+                <Textarea
+                  id="gen-concept-style"
+                  placeholder="Optional concept/style for the image set..."
+                  value={form.conceptStyle}
+                  onChange={(e) => onFieldChange("conceptStyle", e.target.value)}
+                  rows={2}
+                />
+              </div>
+
+              <div>
                 <label htmlFor="gen-sample-prompt" className="mb-1 block text-xs font-medium text-muted-foreground">Input Sample Prompt</label>
                 <Textarea
                   id="gen-sample-prompt"
@@ -256,6 +267,9 @@ export function PreviewDrawer({
                     <option value="2">2</option>
                     <option value="3">3</option>
                     <option value="4">4</option>
+                    <option value="6">6</option>
+                    <option value="8">8</option>
+                    <option value="10">10</option>
                   </Select>
                 </div>
 

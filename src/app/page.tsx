@@ -75,6 +75,7 @@ const RETRY_SKIP_LABEL: Record<string, string> = {
 const DEFAULT_FORM: GenerationFormValues = {
   productType: "cape",
   productDescription: "",
+  conceptStyle: "",
   samplePrompt: "",
   sourceStoragePrefix: "google-drive/01_New_Product_Raw/ARTIC WIDE LAPEL",
   modelReferenceUrl: "",
@@ -1049,6 +1050,7 @@ function Workspace() {
       parameters: {
         product_type: form.productType,
         product_description: form.productDescription,
+        concept_style: form.conceptStyle,
         sample_prompt: form.samplePrompt,
         source_storage_prefix: form.sourceStoragePrefix,
         model_reference_url: sanitizedModelReferenceUrl ?? "",

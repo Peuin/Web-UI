@@ -357,6 +357,7 @@ function stripMarkdownLink(value: string | null | undefined): string | null {
 type WorkflowParameters = {
   product_type?: string;
   product_description?: string;
+  concept_style?: string;
   sample_prompt?: string;
   /** Legacy input key accepted for existing clients. */
   product_attributes?: string;
@@ -530,9 +531,9 @@ function validatePayload(
     return { valid: false, error: "output_type must be image, video, or both" };
   }
 
-  const validImageCounts = [2, 3, 4];
+  const validImageCounts = [2, 3, 4, 6, 8, 10];
   if (!validImageCounts.includes(body.parameters.image_count ?? 0)) {
-    return { valid: false, error: "image_count must be 2, 3, or 4" };
+    return { valid: false, error: "image_count must be 2, 3, 4, 6, 8, or 10" };
   }
 
   const validVideoSeconds = [5, 8, 10];
@@ -568,6 +569,7 @@ function buildN8nPayload(body: WorkflowPayload): Record<string, unknown> {
     source_storage_prefix: params.source_storage_prefix,
     product_type: params.product_type,
     product_description: params.product_description ?? "",
+    concept_style: params.concept_style ?? "",
     sample_prompt: samplePrompt,
     output_type: params.output_type ?? "both",
     image_count: params.image_count,
