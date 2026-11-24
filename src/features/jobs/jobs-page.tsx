@@ -1,8 +1,9 @@
 "use client";
 
-import { ChevronRight, CircleAlert, FileImage, Loader2, RefreshCw } from "lucide-react";
+import { ChevronRight, CircleAlert, Loader2, RefreshCw } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { FileKindIcon } from "@/components/ui/file-kind-icon";
 import { FolderGlyph } from "@/components/ui/folder-glyph";
 import { WorkflowProgress, WorkflowStatusBadge } from "@/components/ui/workflow-status";
 import { cn } from "@/lib/utils/cn";
@@ -241,7 +242,7 @@ export function JobsPage({
                       )}
                     />
                     {isFile ? (
-                      <FileImage className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      <FileKindIcon item={{ name: label, mimeType: null }} className="h-4 w-4 shrink-0" />
                     ) : (
                       <FolderGlyph className="h-4 shrink-0" />
                     )}
@@ -427,7 +428,7 @@ function JobDetail({
                 <ul className="mt-1.5 space-y-0.5 pl-6">
                   {folder.files.map((file) => (
                     <li key={file.id} className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-                      <FileImage className="h-3.5 w-3.5 shrink-0" />
+                      <FileKindIcon item={{ name: file.name ?? "", mimeType: null }} className="h-3.5 w-3.5 shrink-0" />
                       <span className="truncate" title={file.name ?? file.id}>{file.name ?? file.id}</span>
                     </li>
                   ))}

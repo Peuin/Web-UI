@@ -5,28 +5,25 @@ import {
   ArrowLeft,
   ChevronRight,
   Copy,
-  File,
   FileImage,
-  FileText,
-  Film,
   FolderOpen,
   Grid2X2,
   Home as HomeIcon,
   List,
   MoreHorizontal,
-  Music,
   RefreshCw,
   Search,
   Share2,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { FileKindIcon } from "@/components/ui/file-kind-icon";
 import { FolderGlyph } from "@/components/ui/folder-glyph";
 import { Input } from "@/components/ui/input";
 import { copyTextToClipboard } from "@/lib/utils/clipboard";
 import { createBrowserSupabaseClient } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils/cn";
-import { MODEL_STORAGE_BUCKET, MODEL_STORAGE_ROOT, isHiddenDrivePlaceholder, type ViewMode } from "@/lib/utils/drive";
+import { MODEL_STORAGE_BUCKET, MODEL_STORAGE_ROOT, getFileKind, isHiddenDrivePlaceholder, type ViewMode } from "@/lib/utils/drive";
 import { formatBytes, formatDate } from "@/lib/utils/format";
 import type { StorageItem } from "@/types/domain";
 
@@ -114,7 +111,7 @@ export function ModelStorageBrowser() {
           ? a.type === "folder" ? -1 : 1
           : a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
     for (const item of mapped) {
-      if (item.type === "file" && item.mimeType?.startsWith("image/")) {
+      if (item.type === "file" && getFileKind(item) === "image") {
         item.thumbnailUrl = storagePublicUrl(item.path);
       }
     }
@@ -202,21 +199,15 @@ export function ModelStorageBrowser() {
     }
     const boxClass = compact ? "h-8 w-8" : "h-12 w-12";
     const iconClass = compact ? "h-4 w-4" : "h-6 w-6";
-    const Icon = item.mimeType?.startsWith("video/")
-      ? Film
-      : item.mimeType?.startsWith("audio/")
-        ? Music
-        : item.mimeType === "application/pdf" || item.mimeType?.startsWith("text/")
-          ? FileText
-          : File;
     return (
-      <span className={cn("flex items-center justify-center rounded-tile bg-card text-muted-foreground", boxClass)}>
-        <Icon className={iconClass} />
+      <span className={cn("flex items-center justify-center rounded-tile bg-card", boxClass)}>
+        <FileKindIcon item={item} className={iconClass} />
       </span>
     );
   }
 
   const previewUrl = previewItem ? itemPublicUrl(previewItem) : null;
+  const previewKind = previewItem && previewItem.type === "file" ? getFileKind(previewItem) : null;
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col">
@@ -392,12 +383,12 @@ export function ModelStorageBrowser() {
               <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">File Preview</h3>
               <Button variant="ghost" size="icon" aria-label="Close file preview" onClick={() => setPreviewItem(null)}><X className="h-4 w-4" /></Button>
             </div>
-            {previewItem.mimeType?.startsWith("image/") && previewUrl ? (
+            {previewKind === "image" && previewUrl ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img src={previewUrl} alt={previewItem.name} className="max-h-80 w-full rounded-tile bg-secondary object-contain" />
-            ) : previewItem.mimeType?.startsWith("video/") && previewUrl ? (
+            ) : previewKind === "video" && previewUrl ? (
               <video src={previewUrl} controls className="max-h-80 w-full rounded-tile bg-black" />
-            ) : previewItem.mimeType?.startsWith("audio/") && previewUrl ? (
+            ) : previewKind === "audio" && previewUrl ? (
               <audio src={previewUrl} controls className="w-full" />
             ) : (
               <div className="flex h-40 items-center justify-center rounded-tile bg-secondary">{renderItemIcon(previewItem)}</div>

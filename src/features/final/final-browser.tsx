@@ -1,8 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Download, File, FolderOpen, Share2, X } from "lucide-react";
+import { Download, FolderOpen, Share2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { FileExtensionBadge, FileKindIcon } from "@/components/ui/file-kind-icon";
 import { FolderGlyph } from "@/components/ui/folder-glyph";
 import { SidePanel } from "@/components/ui/side-panel";
 import { DriveContent } from "@/features/media/drive-content";
@@ -14,6 +15,7 @@ import {
   FINAL_ROOT_FOLDER_ID,
   FINAL_ROOT_FOLDER_NAME,
   NARROW_SCREEN_QUERY,
+  getFileKind,
   isHiddenDrivePlaceholder,
   stripMarkdownLink,
   type FolderCrumb,
@@ -347,8 +349,9 @@ function FinalPreviewPanel({
   }
 
   const isFolder = item.itemType === "FOLDER";
-  const isImage = item.itemType === "IMAGE";
-  const isVideo = item.itemType === "VIDEO";
+  const kind = getFileKind(item);
+  const isImage = kind === "image";
+  const isVideo = kind === "video";
   const previewId = encodeURIComponent(item.driveItemId);
 
   return (
@@ -371,8 +374,15 @@ function FinalPreviewPanel({
             className="aspect-video w-full"
           />
         ) : (
-          <div className="flex aspect-video items-center justify-center">
-            {isFolder ? <FolderGlyph className="h-16" /> : <File className="h-12 w-12 text-muted-foreground" />}
+          <div className="flex aspect-video flex-col items-center justify-center gap-2">
+            {isFolder ? (
+              <FolderGlyph className="h-16" />
+            ) : (
+              <>
+                <FileKindIcon item={item} className="h-12 w-12" />
+                <FileExtensionBadge item={item} />
+              </>
+            )}
           </div>
         )}
       </div>

@@ -1,17 +1,19 @@
 "use client";
 
-import { Check, Link, MoreHorizontal, Share2 } from "lucide-react";
+import { Check, Link, MoreHorizontal, Play, Share2 } from "lucide-react";
 import Image from "next/image";
 import { memo, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { FileExtensionBadge, FileKindIcon } from "@/components/ui/file-kind-icon";
 import { FolderGlyph } from "@/components/ui/folder-glyph";
 import { copyTextToClipboard } from "@/lib/utils/clipboard";
 import { cn } from "@/lib/utils/cn";
 import {
+  fileKindLabel,
   friendlyItemName,
+  getFileKind,
   skipImageOptimizer,
   stripMarkdownLink,
-  typeIcon,
 } from "@/lib/utils/drive";
 import { formatBytes, formatDate } from "@/lib/utils/format";
 import type { DriveItem } from "@/types/domain";
@@ -60,9 +62,14 @@ export const MediaCard = memo(function MediaCard({
   onOpen: () => void;
   onPrefetch?: () => void;
 }) {
-  const Icon = typeIcon[item.itemType];
   const isFolder = item.itemType === "FOLDER";
+  const kind = getFileKind(item);
   const [copied, setCopied] = useState(false);
+  // A thumbnail that failed to load falls back to the kind icon (keyed by URL so
+  // a recycled card doesn't suppress the next item's thumbnail).
+  const [brokenThumb, setBrokenThumb] = useState<string | null>(null);
+  const isMedia = kind === "image" || kind === "video";
+  const showThumb = isMedia && item.thumbnailUrl !== null && brokenThumb !== item.thumbnailUrl;
   const meta = isFolder ? formatDate(item.modifiedTime) : `${formatDate(item.modifiedTime)} · ${formatBytes(item.sizeBytes)}`;
   const driveLink = stripMarkdownLink(item.webViewLink);
   const friendly = isFolder ? friendlyItemName(item.name) : null;
@@ -95,10 +102,31 @@ export const MediaCard = memo(function MediaCard({
         {/* Drive's folder thumbnails are blurry generic icons — always use our glyph. */}
         {isFolder ? (
           <FolderGlyph className="folder-card-icon h-16 shrink-0 transition-transform duration-300 motion-safe:group-hover:scale-110" />
-        ) : item.thumbnailUrl ? (
-          <Image src={item.thumbnailUrl} alt="" fill sizes="260px" className="object-cover" unoptimized={skipImageOptimizer(item.thumbnailUrl)} referrerPolicy="no-referrer" />
+        ) : showThumb && item.thumbnailUrl ? (
+          <>
+            <Image
+              src={item.thumbnailUrl}
+              alt=""
+              fill
+              sizes="260px"
+              className="object-cover"
+              unoptimized={skipImageOptimizer(item.thumbnailUrl)}
+              referrerPolicy="no-referrer"
+              onError={() => setBrokenThumb(item.thumbnailUrl)}
+            />
+            {kind === "video" ? (
+              <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                <span className="flex h-10 w-10 items-center justify-center rounded-full bg-black/55">
+                  <Play className="ml-0.5 h-5 w-5 fill-white text-white" />
+                </span>
+              </span>
+            ) : null}
+          </>
         ) : (
-          <Icon className="h-10 w-10 text-muted-foreground" />
+          <span className="flex flex-col items-center gap-1.5">
+            <FileKindIcon item={item} className="h-10 w-10" />
+            <FileExtensionBadge item={item} />
+          </span>
         )}
         {item.syncStatus === "STALE" ? <span className="absolute bottom-3 left-3 h-2 w-2 rounded-full bg-amber-500" /> : null}
       </button>
@@ -161,7 +189,6 @@ export const MediaRow = memo(function MediaRow({
   onOpen: () => void;
   onPrefetch?: () => void;
 }) {
-  const Icon = typeIcon[item.itemType];
   const isFolder = item.itemType === "FOLDER";
   const friendly = isFolder ? friendlyItemName(item.name) : null;
 
@@ -188,7 +215,14 @@ export const MediaRow = memo(function MediaRow({
         style={{ paddingLeft: Math.min(item.treeDepth ?? 0, 8) * 14 }}
         onMouseEnter={() => isFolder && onPrefetch?.()}
       >
-        {isFolder ? <FolderGlyph className="h-4 shrink-0" /> : <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />}
+        {isFolder ? (
+          <FolderGlyph className="h-4 shrink-0" />
+        ) : (
+          <span className="flex shrink-0 items-center gap-1.5">
+            <FileKindIcon item={item} className="h-4 w-4 shrink-0" />
+            <FileExtensionBadge item={item} />
+          </span>
+        )}
         <span className="min-w-0">
           <span className="block truncate text-sm font-medium">
             {friendly?.label ?? item.name}
@@ -201,7 +235,7 @@ export const MediaRow = memo(function MediaRow({
           ) : null}
         </span>
       </button>
-      <span className="hidden text-xs text-muted-foreground md:block">{item.itemType}</span>
+      <span className="hidden text-xs text-muted-foreground md:block">{isFolder ? "Folder" : fileKindLabel(item)}</span>
       <span className="hidden text-xs text-muted-foreground md:block">{formatBytes(item.sizeBytes)}</span>
       <span className="hidden text-xs text-muted-foreground md:block">{formatDate(item.modifiedTime)}</span>
       <Button variant="ghost" size="icon" title="Preview metadata" aria-label={`Preview metadata for ${item.name}`} onClick={onPreview}>

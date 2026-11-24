@@ -18,7 +18,7 @@ import {
   validateReferenceImageUrl,
   type GenerationFormValues,
 } from "@/features/media/generation";
-import { PreviewDrawer } from "@/features/media/preview-drawer";
+import { PreviewDrawer, type FolderStats } from "@/features/media/preview-drawer";
 import { DriveModelPickerDialog } from "@/features/model/model-library";
 import {
   normalizeDriveItem,
@@ -39,6 +39,10 @@ import {
   DRIVE_STORAGE_ROOT,
   GENERATION_PREFS_STORAGE_KEY,
   NARROW_SCREEN_QUERY,
+  PANEL_DEFAULT_WIDTH,
+  PANEL_MAX_WIDTH,
+  PANEL_MIN_WIDTH,
+  PANEL_WIDTH_STORAGE_KEY,
   PREVIEW_PANEL_STORAGE_KEY,
   getFolderKey,
   getFolderKeyFromItem,
@@ -99,6 +103,24 @@ function readInitialForm(): GenerationFormValues {
   } catch {
     return DEFAULT_FORM;
   }
+}
+
+// Contents counts for the folder summary — a folder's children are not part of
+// the open listing, so they are counted from its own (cached) listing.
+function folderStatsFromChildren(key: string, children: DriveItem[]): FolderStats {
+  let files = 0;
+  let subfolders = 0;
+  let totalBytes = 0;
+  for (const child of children) {
+    if (isHiddenDrivePlaceholder(child)) continue;
+    if (child.itemType === "FOLDER") {
+      subfolders += 1;
+    } else {
+      files += 1;
+      totalBytes += child.sizeBytes ?? 0;
+    }
+  }
+  return { key, files, subfolders, totalBytes };
 }
 
 export default function Home() {
@@ -162,11 +184,15 @@ function Workspace() {
 
   const syncedFolderIdsRef = useRef(new Set<string>());
   const [previewPanelOpen, setPreviewPanelOpen] = useState(true);
+  const [panelWidth, setPanelWidth] = useState(PANEL_DEFAULT_WIDTH);
+  const panelDragRef = useRef<number | null>(null);
+  const [panelDragging, setPanelDragging] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [form, setForm] = useState<GenerationFormValues>(DEFAULT_FORM);
   const formLoadedRef = useRef(false);
   const [productTypeOptions, setProductTypeOptions] = useState(DEFAULT_PRODUCT_TYPE_OPTIONS);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
+  const dismissSubmitNotice = useCallback(() => setSubmitNotice(null), []);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const accessTokenRef = useRef<string | null>(null);
   useEffect(() => {
@@ -531,6 +557,59 @@ function Workspace() {
     }
   }, [previewPanelOpen]);
 
+  // Restore the details panel width after mount (avoids SSR/CSR mismatch).
+  useEffect(() => {
+    try {
+      const saved = Number(localStorage.getItem(PANEL_WIDTH_STORAGE_KEY));
+      if (saved >= PANEL_MIN_WIDTH && saved <= PANEL_MAX_WIDTH) {
+        queueMicrotask(() => setPanelWidth(Math.round(saved)));
+      }
+    } catch {
+      // Storage unavailable; keep the default.
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PANEL_WIDTH_STORAGE_KEY, String(panelWidth));
+    } catch {
+      // Storage unavailable; the width is a convenience only.
+    }
+  }, [panelWidth]);
+
+  // While dragging the panel edge, keep the resize cursor and stop text selection.
+  useEffect(() => {
+    if (!panelDragging) return;
+    const { cursor, userSelect } = document.body.style;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    return () => {
+      document.body.style.cursor = cursor;
+      document.body.style.userSelect = userSelect;
+    };
+  }, [panelDragging]);
+
+  function onPanelHandleDown(event: React.PointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    panelDragRef.current = event.pointerId;
+    setPanelDragging(true);
+  }
+
+  function onPanelHandleMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (panelDragRef.current !== event.pointerId) return;
+    const grid = event.currentTarget.parentElement;
+    if (!grid) return;
+    const next = Math.round(grid.getBoundingClientRect().right - event.clientX);
+    setPanelWidth(Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, next)));
+  }
+
+  function onPanelHandleUp(event: React.PointerEvent<HTMLDivElement>) {
+    if (panelDragRef.current !== event.pointerId) return;
+    panelDragRef.current = null;
+    setPanelDragging(false);
+  }
+
   useEffect(() => {
     if (!isSignedIn) return;
     const supabase = createBrowserSupabaseClient();
@@ -658,6 +737,40 @@ function Workspace() {
     },
   });
 
+  // The details panel's subject: the checked selection wins over a plain preview.
+  const detailItem = selectedItem ?? previewItem;
+  const detailFolderKey = detailItem?.itemType === "FOLDER" ? getFolderKeyFromItem(detailItem) : null;
+  const [folderStats, setFolderStats] = useState<FolderStats | null>(null);
+
+  // Render-phase reset (same pattern as DriveContent): when the panel's subject
+  // changes, seed stats from the warm snapshot or clear them.
+  const [lastStatsKey, setLastStatsKey] = useState<string | null>(null);
+  if (lastStatsKey !== detailFolderKey) {
+    setLastStatsKey(detailFolderKey);
+    const snapshot = detailFolderKey ? readFolderSnapshot(detailFolderKey) : null;
+    setFolderStats(detailFolderKey && snapshot ? folderStatsFromChildren(detailFolderKey, snapshot.items) : null);
+  }
+
+  // Refresh the summary counts whenever the panel's subject is a folder.
+  useEffect(() => {
+    if (!detailItem || detailItem.itemType !== "FOLDER" || !accessToken) return;
+    const folder = detailItem;
+    const key = getFolderKeyFromItem(folder);
+    const storagePath = folder.connectionId === "storage" ? folder.driveItemId : null;
+    let cancelled = false;
+    void listDriveFolder(accessToken, storagePath ? null : folder.driveItemId, storagePath)
+      .then((result) => {
+        if (cancelled || !result.response?.success) return;
+        setFolderStats(folderStatsFromChildren(key, result.items));
+        writeFolderSnapshot(key, result.items, result.folder);
+        storeFolderChildren(key, result.items, folder.name);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [detailItem, accessToken, listDriveFolder, storeFolderChildren]);
+
   // U11 — "/" focuses the folder search from anywhere (except while typing).
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -681,6 +794,7 @@ function Workspace() {
 
   function applySelection(item: DriveItem) {
     setSelectedItem(item);
+    setPreviewItem(item);
     if (item.itemType === "FOLDER") {
       onFieldChange("sourceStoragePrefix", folderStoragePrefix(item));
     }
@@ -691,6 +805,7 @@ function Workspace() {
     if (!item) return;
     if (selectedItem?.id === id) {
       setSelectedItem(null);
+      setPreviewItem(null);
       return;
     }
     applySelection(item);
@@ -699,7 +814,6 @@ function Workspace() {
   // Single click on a file previews it; a folder opens on single click (U2).
   function selectAndPreview(item: DriveItem) {
     applySelection(item);
-    setPreviewItem(item);
     setPreviewPanelOpen(true);
   }
 
@@ -1072,9 +1186,7 @@ function Workspace() {
     // n8n only acknowledges receipt ("Workflow got started."); it does not
     // return a job ID or wait for validation, so this is "sent", not "done".
     setAppError(null);
-    setSubmitNotice(
-      "Sent to n8n. The workflow runs in the background — results will appear in Final Output when it finishes. Don't submit again unless you're sure the previous run failed.",
-    );
+    setSubmitNotice("Sent to n8n — results will appear in Final Output.");
     toast.success("Media generation submitted.");
     void loadJobs(accessToken);
   }
@@ -1110,8 +1222,9 @@ function Workspace() {
             <div
               className={cn(
                 "grid min-h-0 min-w-0 flex-1",
-                previewPanelOpen ? "grid-cols-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-[minmax(0,1fr)]",
+                previewPanelOpen ? "grid-cols-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_6px_var(--panel-w)]" : "grid-cols-[minmax(0,1fr)]",
               )}
+              style={{ "--panel-w": `${panelWidth}px` } as React.CSSProperties}
             >
               <div className={cn("min-w-0", previewPanelOpen && "xl:border-r xl:border-border")}>
                 <DriveToolbar
@@ -1179,21 +1292,39 @@ function Workspace() {
                 </div>
               </div>
               {previewPanelOpen ? (
+              <>
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize details panel"
+                title="Drag to resize the details panel"
+                className={cn(
+                  "hidden cursor-col-resize transition-colors xl:block",
+                  panelDragging ? "bg-brand/30" : "bg-border/40 hover:bg-brand/20",
+                )}
+                onPointerDown={onPanelHandleDown}
+                onPointerMove={onPanelHandleMove}
+                onPointerUp={onPanelHandleUp}
+                onPointerCancel={onPanelHandleUp}
+              />
               <SidePanel onClose={() => setPreviewPanelOpen(false)}>
               <PreviewDrawer
                 onClose={() => setPreviewPanelOpen(false)}
                 item={previewItem}
                 selectedItem={selectedItem}
+                folderStats={folderStats}
                 form={form}
                 onFieldChange={onFieldChange}
                 productTypeOptions={productTypeOptions}
                 submitNotice={submitNotice}
+                onDismissNotice={dismissSubmitNotice}
                 onOpenModelPicker={() => setDriveModelPickerOpen(true)}
                 submitting={submitting}
                 onSubmit={() => void submitWorkflow()}
                 onOpenFolder={openFolder}
               />
               </SidePanel>
+              </>
               ) : null}
             </div>
           ) : null}

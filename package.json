@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build --webpack",
     "lint": "eslint .",
+    "test": "vitest run",
     "typecheck": "next typegen --webpack && tsc --noEmit"
   },
   "dependencies": {
@@ -27,6 +28,7 @@
     "eslint-config-next": "^16.3.3",
     "postcss": "^8.5.26",
     "tailwindcss": "3.4.17",
-    "typescript": "5.7.3"
+    "typescript": "5.7.3",
+    "vitest": "^3.2.7"
   }
 }

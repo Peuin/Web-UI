@@ -13,6 +13,10 @@ import type { DriveItem } from "@/types/domain";
 // P7 — long folders render progressively; the sentinel reveals the next slice.
 const RENDER_STEP = 200;
 
+// auto-fit + 1fr lets cards grow to fill the row instead of capping at a fixed
+// width and leaving a dead zone on the right.
+const GRID_COLUMNS = "grid-cols-[repeat(auto-fit,minmax(min(100%,200px),1fr))]";
+
 export function DriveContent({
   items,
   selectedItem,
@@ -102,7 +106,7 @@ export function DriveContent({
   if (loading && items.length === 0) {
     return (
       <section className="p-5" aria-busy="true" aria-label="Loading folder">
-        <div className={cn("grid grid-cols-[repeat(auto-fill,minmax(min(100%,190px),240px))] gap-4", gridClassName)}>
+        <div className={cn("grid gap-4", GRID_COLUMNS, gridClassName)}>
           {Array.from({ length: 8 }).map((_, index) => <MediaCardSkeleton key={index} />)}
         </div>
       </section>
@@ -209,7 +213,7 @@ export function DriveContent({
         </div>
       ) : null}
       {viewMode === "grid" ? (
-        <div ref={gridRef} className={cn("grid grid-cols-[repeat(auto-fill,minmax(min(100%,190px),240px))] gap-4", gridClassName)}>
+        <div ref={gridRef} className={cn("grid gap-4", GRID_COLUMNS, gridClassName)}>
           {visibleItems.map((item) => (
             <MediaCard
               key={item.id}
