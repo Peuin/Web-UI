@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "supabase": {
+      "type": "http",
+      "url": "https://mcp.supabase.com/mcp?project_ref=phyuwqgemqiozmgooegm&features=docs%2Caccount%2Cdatabase%2Cdebugging%2Cdevelopment%2Cfunctions%2Cbranching%2Cfeedback%2Cnotebooks"
+    },
+    "n8n": {
+      "type": "http",
+      "url": "https://automation.oxmode.ai/mcp-server/http",
+      "headers": {
+        "Authorization": "Bearer ${N8N_MCP_TOKEN}"
+      }
+    }
+  }
+}

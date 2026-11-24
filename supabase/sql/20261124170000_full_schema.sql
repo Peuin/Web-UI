@@ -1578,7 +1578,7 @@ select cron.schedule(
   '0 20 * * *',
   $cmd$
   select net.http_post(
-    url := 'https://svykhovdpaviqgouaafh.supabase.co/functions/v1/storage-purge-cron',
+    url := 'https://phyuwqgemqiozmgooegm.supabase.co/functions/v1/storage-purge-cron',
     headers := jsonb_build_object(
       'Content-Type', 'application/json',
       'X-Purge-Token', (select decrypted_secret from vault.decrypted_secrets where name = 'storage_purge_token')
@@ -1592,3 +1592,34 @@ select cron.schedule(
 -- Cron "drive-sync-folders-every-30m" (*/30 * * * *) calls the drive-sync-cron Edge Function.
 -- Its live definition hardcodes a secret key in the header, so it is NOT reproduced here.
 -- Store that secret in Vault first, then schedule it the same way as the job above.
+
+-- Seed: Default Drive connection used by the UI, drive-sync and drive-sync-cron
+-- (DEFAULT_CONNECTION_ID = 00000000-0000-0000-0000-000000000000).
+-- drive_items.connection_id has an FK to drive_connections, so without this row every
+-- n8n sync callback fails with "violates foreign key constraint drive_items_connection_id_fkey".
+-- created_by is NOT NULL: owned by admin@admin.local, else the oldest auth user.
+-- Skips with a notice when no auth user exists yet; re-run this block after creating the admin.
+do $$
+declare
+  v_owner_id uuid;
+begin
+  select id into v_owner_id
+  from auth.users
+  order by (lower(email) = 'admin@admin.local') desc, created_at asc
+  limit 1;
+
+  if v_owner_id is null then
+    raise notice 'No auth user yet: Default Drive connection not seeded. Create the admin user and re-run this block.';
+    return;
+  end if;
+
+  insert into public.drive_connections (id, name, connection_type, root_folder_id, created_by)
+  values (
+    '00000000-0000-0000-0000-000000000000',
+    'Default Drive',
+    'MY_DRIVE',
+    '1cMsSZ66rvnFvbf4ZRsV1QcpYeOzp0Inq',
+    v_owner_id
+  )
+  on conflict (id) do nothing;
+end $$;

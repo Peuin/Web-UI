@@ -20,7 +20,7 @@ http://localhost:3000
 Copy `.env.example` to `.env.local` and set:
 
 ```text
-NEXT_PUBLIC_SUPABASE_URL=https://svykhovdpaviqgouaafh.supabase.co
+NEXT_PUBLIC_SUPABASE_URL=https://phyuwqgemqiozmgooegm.supabase.co
 NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-publishable-or-anon-key
 ```
 
